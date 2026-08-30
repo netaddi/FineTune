@@ -30,6 +30,19 @@ final class AUEffectChain: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "AUEffectChain")
 
     var isBypassed: Bool { _isBypassed }
+    /// True when this chain will actually modify audio if called. The callback uses this
+    /// to decide whether a multichannel device stream needs its preferred stereo pair
+    /// extracted for processing; an empty, bypassed, or fully disabled chain must preserve
+    /// the original multichannel path.
+    @inline(__always)
+    var isProcessingEnabled: Bool {
+        guard !_isBypassed else { return false }
+        let count = _hostCount
+        for index in 0..<count where _hosts[index].isEnabled {
+            return true
+        }
+        return false
+    }
     /// User intent is kept separate from the internal fail-closed rate latch. UI and
     /// persistence must not turn a transient safety bypass into a permanent user bypass.
     var isUserBypassed: Bool { _userBypassed }

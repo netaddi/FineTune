@@ -88,10 +88,18 @@ If the keys still don't work right after launch, a WindowServer handoff can brie
 
 ## EQ not applying / sounds the same
 
-- The EQ is enabled by default. Check that the **toggle switch** in the EQ panel header is on.
+- The built-in EQ starts flat and off for an app with no saved choice. Check that the **toggle switch** in the EQ panel header is on.
 - The default preset is **Flat** (all bands at 0 dB), which makes no audible changes. Select a different preset or adjust the bands manually.
 - EQ is **per-app**, not per-device. Make sure you're adjusting the EQ for the correct app.
 - If using AutoEQ headphone correction, that's separate from the 10-band EQ. Verify a profile is assigned to the correct device via the wand icon
+
+## Audio Unit loads but sound does not change
+
+- Confirm that both the effect row and the app's whole AU chain are enabled, and that the app is actively producing audio.
+- A plug-in window opening only proves that the AU instance loaded. Compare chain bypass on/off with an intentionally obvious effect or preset to verify the render path.
+- On a multichannel interface, FineTune processes the tap source's preferred L/R pair and places it on the output destination's preferred L/R pair. Other native channels pass through. Confirm that the destination's preferred pair is connected to the speakers or loopback being monitored.
+- Many effects, including Console 1, can be close to neutral in their default state. Save a clearly non-neutral preset before concluding that processing is bypassed.
+- After changing a plug-in installation, Audio MIDI Setup channel assignment, or device route, quit and reopen FineTune so the tap and AU formats are rebuilt together.
 
 ## Audio quality sounds degraded
 

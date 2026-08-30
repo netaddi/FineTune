@@ -115,8 +115,10 @@ private func processWithDefaults(
         crossfadeMultiplier: crossfadeMultiplier,
         outputGateMultiplier: outputGateMultiplier,
         rampCoefficient: rampCoefficient,
-        preferredStereoLeft: preferredStereoLeft,
-        preferredStereoRight: preferredStereoRight,
+        inputStereoLeft: preferredStereoLeft,
+        inputStereoRight: preferredStereoRight,
+        outputStereoLeft: preferredStereoLeft,
+        outputStereoRight: preferredStereoRight,
         currentVol: &currentVol,
         eqProc: eqProc,
         autoEQProc: autoEQProc,
@@ -190,6 +192,53 @@ struct CallbackGenerationGateTests {
             secondaryAtStart: 9,
             currentSecondary: 9
         ))
+    }
+}
+
+@Suite("ProcessTapController — Input Measurement")
+struct InputMeasurementTests {
+    @Test("Multichannel peak detection observes a preferred pair when channel zero is silent")
+    func multichannelPreferredPairOpensGate() {
+        let frames = 64
+        let channels = 16
+        let input = TestABL(buffers: [(channels: UInt32(channels), frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            samples[frame * channels + 2] = 0.25
+            samples[frame * channels + 3] = -0.75
+        }
+
+        let measurement = ProcessTapController.measureInputBuffers(input.bufferList)
+        #expect(measurement.peak == 0.75)
+        #expect(measurement.frameCount == frames)
+
+        var phase: UInt8 = 0
+        var progress: Float = 0
+        var silentSamples: Int32 = 0
+        _ = ProcessTapController.advanceOutputGate(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silentSamples,
+            maxPeak: measurement.peak,
+            frameCount: measurement.frameCount,
+            rampSamples: 1_920,
+            silenceHoldSamples: 9_600
+        )
+        #expect(phase == 1, "Signal outside channel zero must open the output gate")
+    }
+
+    @Test("Stereo peak detection observes a right-only signal")
+    func rightOnlyStereoSignalIsMeasured() {
+        let frames = 16
+        let input = TestABL(buffers: [(channels: 2, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            samples[frame * 2 + 1] = -0.4
+        }
+
+        let measurement = ProcessTapController.measureInputBuffers(input.bufferList)
+        #expect(abs(measurement.peak - 0.4) < 1e-6)
+        #expect(measurement.frameCount == frames)
     }
 }
 
@@ -954,8 +1003,10 @@ struct ProcessingChainTests {
             crossfadeMultiplier: 1,
             outputGateMultiplier: 1,
             rampCoefficient: 1,
-            preferredStereoLeft: 0,
-            preferredStereoRight: 1,
+            inputStereoLeft: 0,
+            inputStereoRight: 1,
+            outputStereoLeft: 0,
+            outputStereoRight: 1,
             currentVol: &volume,
             eqProc: nil,
             autoEQProc: nil,
@@ -974,6 +1025,496 @@ struct ProcessingChainTests {
             maxDifference = max(maxDifference, abs(first[index] - second[index]))
         }
         #expect(maxDifference < 1e-6)
+    }
+
+    @Test(
+        "Stereo AU processes the preferred pair inside a multichannel device stream",
+        arguments: [true, false]
+    )
+    func stereoAUProcessesPreferredMultichannelPair(appScoped: Bool) throws {
+        let frames = 512
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let preferredLeft = 2
+        let preferredRight = 3
+        let input = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let output = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            let base = frame * channels
+            for channel in 0..<channels {
+                samples[base + channel] = Float(channel + 1) / 100
+            }
+            let highFrequency = sinf(2 * .pi * 15_000 * Float(frame) / 48_000) * 0.25
+            samples[base + preferredLeft] = highFrequency
+            samples[base + preferredRight] = highFrequency
+        }
+
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let chain = AUEffectChain(
+            entries: [AUEffectChainEntry(plugin: descriptor)],
+            sampleRate: 48_000,
+            maxFrames: UInt32(frames)
+        )
+        let host = try #require(chain.hosts.first)
+        let au = try #require(host.audioUnit)
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 100, 0) == noErr)
+
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        for _ in 0..<20 {
+            ProcessTapController.processMappedBuffers(
+                inputBuffers: input.bufferList,
+                outputBuffers: output.bufferList,
+                targetVol: 1,
+                crossfadeMultiplier: 1,
+                outputGateMultiplier: 1,
+                rampCoefficient: 1,
+                inputStereoLeft: preferredLeft,
+                inputStereoRight: preferredRight,
+                outputStereoLeft: preferredLeft,
+                outputStereoRight: preferredRight,
+                currentVol: &volume,
+                eqProc: nil,
+                autoEQProc: nil,
+                appAUChain: appScoped ? chain : nil,
+                deviceAUChain: appScoped ? nil : chain,
+                loudnessEqualizerProc: nil,
+                loudnessCompensatorProc: nil,
+                appProcessingScratch: scratch,
+                appProcessingFrameCapacity: frames
+            )
+        }
+
+        let processed = output.data(at: 0)
+        var preferredPairEnergy: Float = 0
+        for frame in 0..<frames {
+            let base = frame * channels
+            preferredPairEnergy += processed[base + preferredLeft] * processed[base + preferredLeft]
+            preferredPairEnergy += processed[base + preferredRight] * processed[base + preferredRight]
+            for channel in 0..<channels where channel != preferredLeft && channel != preferredRight {
+                #expect(
+                    processed[base + channel] == samples[base + channel],
+                    "Non-preferred channel \(channel) must pass through unchanged"
+                )
+            }
+        }
+        #expect(
+            preferredPairEnergy < 0.05,
+            "The 15 kHz preferred pair should be nearly silent after the 100 Hz low-pass AU"
+        )
+    }
+
+    @Test("Multichannel tap source pair is independent from the output destination pair")
+    func sourceAndOutputStereoPairsAreIndependent() throws {
+        let frames = 512
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let inputLeft = 2
+        let inputRight = 3
+        let outputLeft = 0
+        let outputRight = 1
+        let input = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let output = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            let base = frame * channels
+            for channel in 0..<channels {
+                samples[base + channel] = Float(channel + 1) / 100
+            }
+            let highFrequency = sinf(2 * .pi * 15_000 * Float(frame) / 48_000) * 0.25
+            samples[base + inputLeft] = highFrequency
+            samples[base + inputRight] = highFrequency
+        }
+
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let chain = AUEffectChain(
+            entries: [AUEffectChainEntry(plugin: descriptor)],
+            sampleRate: 48_000,
+            maxFrames: UInt32(frames)
+        )
+        let au = try #require(chain.hosts.first?.audioUnit)
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 100, 0) == noErr)
+
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        for _ in 0..<20 {
+            ProcessTapController.processMappedBuffers(
+                inputBuffers: input.bufferList,
+                outputBuffers: output.bufferList,
+                targetVol: 1,
+                crossfadeMultiplier: 1,
+                outputGateMultiplier: 1,
+                rampCoefficient: 1,
+                inputStereoLeft: inputLeft,
+                inputStereoRight: inputRight,
+                outputStereoLeft: outputLeft,
+                outputStereoRight: outputRight,
+                currentVol: &volume,
+                eqProc: nil,
+                autoEQProc: nil,
+                appAUChain: chain,
+                deviceAUChain: nil,
+                loudnessEqualizerProc: nil,
+                loudnessCompensatorProc: nil,
+                appProcessingScratch: scratch,
+                appProcessingFrameCapacity: frames
+            )
+        }
+
+        let processed = output.data(at: 0)
+        var outputPairEnergy: Float = 0
+        for frame in 0..<frames {
+            let base = frame * channels
+            outputPairEnergy += processed[base + outputLeft] * processed[base + outputLeft]
+            outputPairEnergy += processed[base + outputRight] * processed[base + outputRight]
+            #expect(processed[base + inputLeft] == samples[base + inputLeft])
+            #expect(processed[base + inputRight] == samples[base + inputRight])
+        }
+        #expect(
+            outputPairEnergy < 0.05,
+            "The AU must process source channels 2/3 before placing them on output channels 0/1"
+        )
+    }
+
+    @Test("Built-in EQ processes the preferred pair inside a multichannel device stream")
+    func builtInEQProcessesPreferredMultichannelPair() {
+        let frames = 4_096
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let preferredLeft = 2
+        let preferredRight = 3
+        let input = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let output = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            let base = frame * channels
+            let tone = sinf(2 * .pi * 1_000 * Float(frame) / 48_000) * 0.1
+            samples[base] = 0.125
+            samples[base + 1] = -0.125
+            samples[base + preferredLeft] = tone
+            samples[base + preferredRight] = tone
+        }
+
+        let eq = EQProcessor(sampleRate: 48_000)
+        var gains = [Float](repeating: 0, count: 10)
+        gains[5] = 12
+        eq.updateSettings(EQSettings(bandGains: gains, isEnabled: true))
+
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 1,
+            inputStereoLeft: preferredLeft,
+            inputStereoRight: preferredRight,
+            outputStereoLeft: preferredLeft,
+            outputStereoRight: preferredRight,
+            currentVol: &volume,
+            eqProc: eq,
+            autoEQProc: nil,
+            appAUChain: nil,
+            deviceAUChain: nil,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: frames
+        )
+
+        let processed = output.data(at: 0)
+        var inputPairEnergy: Float = 0
+        var outputPairEnergy: Float = 0
+        for frame in 0..<frames {
+            let base = frame * channels
+            if frame >= 1_024 {
+                inputPairEnergy += samples[base + preferredLeft] * samples[base + preferredLeft]
+                inputPairEnergy += samples[base + preferredRight] * samples[base + preferredRight]
+                outputPairEnergy += processed[base + preferredLeft] * processed[base + preferredLeft]
+                outputPairEnergy += processed[base + preferredRight] * processed[base + preferredRight]
+            }
+            #expect(processed[base] == 0.125)
+            #expect(processed[base + 1] == -0.125)
+        }
+        #expect(
+            outputPairEnergy > inputPairEnergy * 4,
+            "The steady-state 1 kHz preferred pair should be boosted by the +12 dB 1 kHz band"
+        )
+    }
+
+    @Test("Multichannel fan-out clamps every output to the shared stereo frame count")
+    func multichannelFanOutClampsMismatchedFrameCounts() {
+        let shortFrames = 8
+        let longFrames = 32
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let input = TestABL(buffers: [
+            (channels: channelCount, frames: shortFrames),
+            (channels: channelCount, frames: longFrames),
+        ])
+        let output = TestABL(buffers: [
+            (channels: channelCount, frames: shortFrames),
+            (channels: channelCount, frames: longFrames),
+        ])
+        fill(input, bufferIndex: 0, value: 0.1)
+        fill(input, bufferIndex: 1, value: 0.2)
+        fill(output, bufferIndex: 0, value: 0.9)
+        fill(output, bufferIndex: 1, value: 0.9)
+
+        let eq = EQProcessor(sampleRate: 48_000)
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: shortFrames * 2)
+        scratch.initialize(repeating: 0, count: shortFrames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 1,
+            inputStereoLeft: 2,
+            inputStereoRight: 3,
+            outputStereoLeft: 2,
+            outputStereoRight: 3,
+            currentVol: &volume,
+            eqProc: eq,
+            autoEQProc: nil,
+            appAUChain: nil,
+            deviceAUChain: nil,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: shortFrames
+        )
+
+        let longOutput = output.data(at: 1)
+        for frame in 0..<shortFrames {
+            let base = frame * channels
+            for channel in 0..<channels where channel != 2 && channel != 3 {
+                #expect(longOutput[base + channel] == 0.2)
+            }
+        }
+        for index in (shortFrames * channels)..<(longFrames * channels) {
+            #expect(longOutput[index] == 0, "Unmapped tail samples must be zeroed")
+        }
+    }
+
+    @Test("Multichannel fan-out advances one shared gain ramp for every channel and output")
+    func multichannelFanOutUsesOneGainRamp() {
+        let frames = 4
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let input = TestABL(buffers: [
+            (channels: channelCount, frames: frames),
+            (channels: channelCount, frames: frames),
+        ])
+        let output = TestABL(buffers: [
+            (channels: channelCount, frames: frames),
+            (channels: channelCount, frames: frames),
+        ])
+        fill(input, bufferIndex: 0, value: 0.1)
+        fill(input, bufferIndex: 1, value: 0.1)
+
+        let eq = EQProcessor(sampleRate: 48_000)
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 0
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 0.5,
+            inputStereoLeft: 2,
+            inputStereoRight: 3,
+            outputStereoLeft: 2,
+            outputStereoRight: 3,
+            currentVol: &volume,
+            eqProc: eq,
+            autoEQProc: nil,
+            appAUChain: nil,
+            deviceAUChain: nil,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: frames
+        )
+
+        #expect(abs(volume - 0.9375) < 1e-6, "The gain state must advance once per frame, not once per output")
+        let expectedGains: [Float] = [0.5, 0.75, 0.875, 0.9375]
+        let first = output.data(at: 0)
+        let second = output.data(at: 1)
+        for frame in 0..<frames {
+            let base = frame * channels
+            let expected = 0.1 * expectedGains[frame]
+            #expect(abs(first[base] - expected) < 1e-6)
+            #expect(abs(first[base + 2] - expected) < 1e-4)
+            for channel in 0..<channels {
+                #expect(abs(first[base + channel] - second[base + channel]) < 1e-6)
+            }
+        }
+    }
+
+    @Test("Limiter protects non-preferred lanes after multichannel stereo processing")
+    func limiterProtectsNonPreferredMultichannelLanes() {
+        let frames = 16
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let input = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let output = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            let base = frame * channels
+            samples[base + 2] = 0.1
+            samples[base + 3] = 0.1
+            samples[base + 7] = 1.5
+        }
+
+        let eq = EQProcessor(sampleRate: 48_000)
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 1,
+            inputStereoLeft: 2,
+            inputStereoRight: 3,
+            outputStereoLeft: 2,
+            outputStereoRight: 3,
+            currentVol: &volume,
+            eqProc: eq,
+            autoEQProc: nil,
+            appAUChain: nil,
+            deviceAUChain: nil,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: frames
+        )
+
+        let processed = output.data(at: 0)
+        for frame in 0..<frames {
+            let limited = processed[frame * channels + 7]
+            #expect(limited <= SoftLimiter.ceiling)
+            #expect(limited > SoftLimiter.threshold)
+        }
+    }
+
+    @Test("AU chain processing eligibility follows host enable and chain bypass state")
+    func auChainProcessingEligibility() throws {
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let chain = AUEffectChain(
+            entries: [AUEffectChainEntry(plugin: descriptor)],
+            sampleRate: 48_000,
+            maxFrames: 64
+        )
+        let host = try #require(chain.hosts.first)
+
+        #expect(chain.isProcessingEnabled)
+        host.setEnabled(false)
+        #expect(!chain.isProcessingEnabled)
+        host.setEnabled(true)
+        chain.setBypassed(true)
+        #expect(!chain.isProcessingEnabled)
+    }
+
+    @Test("A bypassed AU preserves the complete multichannel stream")
+    func bypassedAUPreservesMultichannelStream() {
+        let frames = 64
+        let channelCount: UInt32 = 16
+        let channels = Int(channelCount)
+        let input = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let output = TestABL(buffers: [(channels: channelCount, frames: frames)])
+        let samples = input.data(at: 0)
+        for frame in 0..<frames {
+            for channel in 0..<channels {
+                samples[frame * channels + channel] = Float(channel + 1) / 64
+            }
+        }
+
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let chain = AUEffectChain(
+            entries: [AUEffectChainEntry(plugin: descriptor)],
+            sampleRate: 48_000,
+            maxFrames: UInt32(frames)
+        )
+        chain.setBypassed(true)
+
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 1,
+            inputStereoLeft: 2,
+            inputStereoRight: 3,
+            outputStereoLeft: 2,
+            outputStereoRight: 3,
+            currentVol: &volume,
+            eqProc: nil,
+            autoEQProc: nil,
+            appAUChain: chain,
+            deviceAUChain: nil,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: frames
+        )
+
+        let processed = output.data(at: 0)
+        for index in 0..<(frames * channels) {
+            #expect(processed[index] == samples[index])
+        }
     }
 }
 

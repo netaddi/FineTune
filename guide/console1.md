@@ -42,6 +42,22 @@ A plug-in quarantined after a crash is not instantiated and does not reserve a
 position. Resolve the plug-in problem before removing and adding it again; this
 prevents a repeated startup crash loop.
 
+## Multichannel signal path
+
+Some USB interfaces expose a stream-specific tap with more than two channels.
+FineTune resolves the tap source and output destination independently: it
+extracts the source device's preferred L/R pair, runs the per-app EQ and Audio
+Unit chain once as stereo, and writes the result to the destination device's
+preferred L/R pair. Every other native channel passes through with the same
+gain ramp and limiter protection.
+
+Seeing the Console 1 window or component in memory proves that the instance
+loaded, but not by itself that audio reached its render callback. If a plug-in
+appears loaded while the sound remains unchanged, compare the chain bypass with
+a deliberately obvious effect or preset. Also confirm that the interface's
+preferred output pair is the pair connected to the monitor path. See the
+[troubleshooting guide](troubleshooting.md#audio-unit-loads-but-sound-does-not-change).
+
 ## Built-in EQ is independent
 
 The FineTune 10-band EQ is separate from the Audio Unit chain. An app with no

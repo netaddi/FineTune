@@ -68,10 +68,17 @@ final class ProcessTapController: ProcessTapControlling {
     private nonisolated(unsafe) var _secondaryPeakLevel: Float = 0.0
     private nonisolated(unsafe) var _currentDeviceVolume: Float = 1.0
     private nonisolated(unsafe) var _isDeviceMuted: Bool = false
-    private nonisolated(unsafe) var _primaryPreferredStereoLeftChannel: Int = 0
-    private nonisolated(unsafe) var _primaryPreferredStereoRightChannel: Int = 1
-    private nonisolated(unsafe) var _secondaryPreferredStereoLeftChannel: Int = 0
-    private nonisolated(unsafe) var _secondaryPreferredStereoRightChannel: Int = 1
+    /// The tap source and output destination can be different devices. Keep their preferred
+    /// pairs separate so a stream-specific multichannel tap is extracted from the source
+    /// pair, then placed on the destination pair.
+    private nonisolated(unsafe) var _primaryTapStereoLeftChannel: Int = 0
+    private nonisolated(unsafe) var _primaryTapStereoRightChannel: Int = 1
+    private nonisolated(unsafe) var _primaryOutputStereoLeftChannel: Int = 0
+    private nonisolated(unsafe) var _primaryOutputStereoRightChannel: Int = 1
+    private nonisolated(unsafe) var _secondaryTapStereoLeftChannel: Int = 0
+    private nonisolated(unsafe) var _secondaryTapStereoRightChannel: Int = 1
+    private nonisolated(unsafe) var _secondaryOutputStereoLeftChannel: Int = 0
+    private nonisolated(unsafe) var _secondaryOutputStereoRightChannel: Int = 1
     /// Monotonic host tick of the last audio callback execution.
     private nonisolated(unsafe) var _lastRenderHostTime: UInt64 = 0
     /// Monotonic host tick of successful activation.
@@ -209,7 +216,7 @@ final class ProcessTapController: ProcessTapControlling {
     private var deviceOperationWaiters: [CheckedContinuation<Void, Never>] = []
     /// Cancellable crossfade task — cancelled when a new switch starts
     private var crossfadeTask: Task<Void, Error>?
-    private var didLogEQBypassForMultichannel = false
+    private var didLogStereoPairProcessingForMultichannel = false
 
     // MARK: - Public Properties
 
@@ -765,6 +772,20 @@ final class ProcessTapController: ProcessTapControlling {
         return deviceID.preferredStereoChannelIndices()
     }
 
+    /// Resolves channel indices inside the actual tap buffer. A failed stream-specific tap
+    /// falls back to stereo mixdown even when `sourceDeviceUID` is multichannel, so the
+    /// tap's reported format is the authority for whether device preferred indices apply.
+    private func preferredTapStereoChannels(
+        for tapID: AudioObjectID,
+        sourceDeviceUID: String?
+    ) -> (left: Int, right: Int) {
+        guard let asbd = try? tapID.readAudioTapStreamBasicDescription(),
+              asbd.mChannelsPerFrame > 2 else {
+            return (0, 1)
+        }
+        return preferredStereoChannels(for: sourceDeviceUID)
+    }
+
     /// Per-input-stream "is used" flags for `kAudioDevicePropertyIOProcStreamUsage`, or `nil`
     /// when there is nothing to disable. Only the trailing `outputCount` input streams (the
     /// process tap — the only input the audio callback reads) are marked used.
@@ -842,13 +863,13 @@ final class ProcessTapController: ProcessTapControlling {
         return nil
     }
 
-    private func maybeLogEQBypass(for tapID: AudioObjectID) {
-        guard !didLogEQBypassForMultichannel else { return }
+    private func maybeLogMultichannelStereoPairProcessing(for tapID: AudioObjectID) {
+        guard !didLogStereoPairProcessingForMultichannel else { return }
         guard let asbd = try? tapID.readAudioTapStreamBasicDescription() else { return }
         guard asbd.mChannelsPerFrame != 2 else { return }
 
-        didLogEQBypassForMultichannel = true
-        logger.info("EQ processing is stereo-only and will be bypassed for tap format with \(asbd.mChannelsPerFrame) channels.")
+        didLogStereoPairProcessingForMultichannel = true
+        logger.info("Stereo EQ/AU processing will use the preferred L/R pair for tap format with \(asbd.mChannelsPerFrame) channels; other channels pass through.")
     }
 
     /// Creates a process tap, preferring a device-stream tap to preserve multichannel routing.
@@ -867,7 +888,7 @@ final class ProcessTapController: ProcessTapControlling {
                 let err = AudioHardwareCreateProcessTap(streamTap, &tapID)
                 if err == noErr {
                     logger.info("Created stream-specific tap for device \(deviceUID, privacy: .public) (stream \(outputStream))")
-                    maybeLogEQBypass(for: tapID)
+                    maybeLogMultichannelStereoPairProcessing(for: tapID)
                     return (streamTap, tapID)
                 }
 
@@ -898,7 +919,7 @@ final class ProcessTapController: ProcessTapControlling {
         if preferredDeviceUID != nil {
             logger.info("Using stereo mixdown tap fallback")
         }
-        maybeLogEQBypass(for: mixdownTapID)
+        maybeLogMultichannelStereoPairProcessing(for: mixdownTapID)
         return (mixdownTap, mixdownTapID)
     }
 
@@ -916,9 +937,15 @@ final class ProcessTapController: ProcessTapControlling {
         // stereo matrix attenuation on interfaces with many output channels.
         let (tapDesc, tapID) = try createProcessTap(preferredDeviceUID: preferredTapSourceDeviceUID)
         primaryResources.tapDescription = tapDesc
-        let preferred = preferredStereoChannels(for: targetDeviceUIDs.first)
-        _primaryPreferredStereoLeftChannel = preferred.left
-        _primaryPreferredStereoRightChannel = preferred.right
+        let tapPreferred = preferredTapStereoChannels(
+            for: tapID,
+            sourceDeviceUID: preferredTapSourceDeviceUID
+        )
+        _primaryTapStereoLeftChannel = tapPreferred.left
+        _primaryTapStereoRightChannel = tapPreferred.right
+        let outputPreferred = preferredStereoChannels(for: targetDeviceUIDs.first)
+        _primaryOutputStereoLeftChannel = outputPreferred.left
+        _primaryOutputStereoRightChannel = outputPreferred.right
 
         primaryResources.tapID = tapID
         logger.debug("Created process tap #\(tapID)")
@@ -1489,9 +1516,15 @@ final class ProcessTapController: ProcessTapControlling {
 
         let (tapDesc, tapID) = try createProcessTap(preferredDeviceUID: tapSourceDeviceUID)
         secondaryResources.tapDescription = tapDesc
-        let preferred = preferredStereoChannels(for: outputUIDs.first)
-        _secondaryPreferredStereoLeftChannel = preferred.left
-        _secondaryPreferredStereoRightChannel = preferred.right
+        let tapPreferred = preferredTapStereoChannels(
+            for: tapID,
+            sourceDeviceUID: tapSourceDeviceUID
+        )
+        _secondaryTapStereoLeftChannel = tapPreferred.left
+        _secondaryTapStereoRightChannel = tapPreferred.right
+        let outputPreferred = preferredStereoChannels(for: outputUIDs.first)
+        _secondaryOutputStereoLeftChannel = outputPreferred.left
+        _secondaryOutputStereoRightChannel = outputPreferred.right
 
         secondaryResources.tapID = tapID
         logger.debug("[CROSSFADE] Created secondary tap #\(tapID)")
@@ -1731,8 +1764,10 @@ final class ProcessTapController: ProcessTapControlling {
         }
 
         _primaryCurrentVolume = _secondaryCurrentVolume
-        _primaryPreferredStereoLeftChannel = _secondaryPreferredStereoLeftChannel
-        _primaryPreferredStereoRightChannel = _secondaryPreferredStereoRightChannel
+        _primaryTapStereoLeftChannel = _secondaryTapStereoLeftChannel
+        _primaryTapStereoRightChannel = _secondaryTapStereoRightChannel
+        _primaryOutputStereoLeftChannel = _secondaryOutputStereoLeftChannel
+        _primaryOutputStereoRightChannel = _secondaryOutputStereoRightChannel
         updateMaxTailTime()
 
         // Reassign callback role AFTER all state is swapped.
@@ -1814,7 +1849,11 @@ final class ProcessTapController: ProcessTapControlling {
         // _forceSilence (primary role zeros output) and the stale callbackID (after reassignment
         // below, old callback no longer matches _primaryCallbackID → zeros output) prevent races
         // with processMappedBuffers().
-        let preferred = preferredStereoChannels(for: outputUIDs.first)
+        let tapPreferred = preferredTapStereoChannels(
+            for: tapID,
+            sourceDeviceUID: tapSourceDeviceUID
+        )
+        let outputPreferred = preferredStereoChannels(for: outputUIDs.first)
 
         newResources.tapID = tapID
 
@@ -1892,8 +1931,10 @@ final class ProcessTapController: ProcessTapControlling {
         // this point it deliberately renders silence as a stale callback, while the old
         // primary keeps its identity. A create/start failure therefore leaves the old
         // callback valid and able to resume when the force-silence defer runs.
-        _primaryPreferredStereoLeftChannel = preferred.left
-        _primaryPreferredStereoRightChannel = preferred.right
+        _primaryTapStereoLeftChannel = tapPreferred.left
+        _primaryTapStereoRightChannel = tapPreferred.right
+        _primaryOutputStereoLeftChannel = outputPreferred.left
+        _primaryOutputStereoRightChannel = outputPreferred.right
         OSMemoryBarrier()
         _primaryCallbackID = switchCallbackID
 
@@ -1967,6 +2008,31 @@ final class ProcessTapController: ProcessTapControlling {
             || (secondaryAtStart & 1 == 0 && secondaryAtStart == currentSecondary)
     }
 
+    /// Scans every channel in each interleaved HAL input buffer. Stream-specific taps can
+    /// carry the audible program on a preferred pair other than channel 0; looking only at
+    /// the first lane would keep the output gate closed and suppress the entire AU path.
+    @inline(__always)
+    nonisolated static func measureInputBuffers(
+        _ inputBuffers: UnsafeMutableAudioBufferListPointer
+    ) -> (peak: Float, frameCount: Int) {
+        var maxPeak: Float = 0
+        var firstBufferFrameCount = 0
+        for inputBuffer in inputBuffers {
+            guard let inputData = inputBuffer.mData else { continue }
+            let inputSamples = inputData.assumingMemoryBound(to: Float.self)
+            let channels = max(1, Int(inputBuffer.mNumberChannels))
+            let sampleCount = Int(inputBuffer.mDataByteSize) / MemoryLayout<Float>.size
+            if firstBufferFrameCount == 0 {
+                firstBufferFrameCount = sampleCount / channels
+            }
+            for index in 0..<sampleCount {
+                let magnitude = abs(inputSamples[index])
+                if magnitude > maxPeak { maxPeak = magnitude }
+            }
+        }
+        return (min(maxPeak, 1), firstBufferFrameCount)
+    }
+
     /// Advance the output-gate state machine for one buffer and return the multiplier
     /// to apply to this buffer's output. Pure function; no class state. RT-safe:
     /// no allocations, no locks, no Foundation. One `cos` per buffer (not per sample).
@@ -2025,8 +2091,10 @@ final class ProcessTapController: ProcessTapControlling {
         crossfadeMultiplier: Float,
         outputGateMultiplier: Float,
         rampCoefficient: Float,
-        preferredStereoLeft: Int,
-        preferredStereoRight: Int,
+        inputStereoLeft: Int,
+        inputStereoRight: Int,
+        outputStereoLeft: Int,
+        outputStereoRight: Int,
         currentVol: inout Float,
         eqProc: EQProcessor?,
         autoEQProc: AutoEQProcessor?,
@@ -2044,6 +2112,13 @@ final class ProcessTapController: ProcessTapControlling {
         // processed stereo block, then copy it to every aggregate output. This prevents
         // app/device AU sample time, filter state, loudness state, and gain ramps from
         // advancing once per destination device.
+        let sharedProcessingInitialVolume = currentVol
+        let hasActiveStereoProcessing = eqProc?.isEnabled == true
+            || autoEQProc?.isEnabled == true
+            || appAUChain?.isProcessingEnabled == true
+            || deviceAUChain?.isProcessingEnabled == true
+            || loudnessEqualizerProc?.isEnabled == true
+            || loudnessCompensatorProc?.isEnabled == true
         var sharedProcessingFrameCount = 0
         if let appProcessingScratch,
            appProcessingFrameCapacity > 0,
@@ -2055,21 +2130,43 @@ final class ProcessTapController: ProcessTapControlling {
             if canonicalInputIndex < inputBufferCount {
                 let inputBuffer = inputBuffers[canonicalInputIndex]
                 let inputChannels = max(1, Int(inputBuffer.mNumberChannels))
-                if inputChannels == 2, let inputData = inputBuffer.mData {
+                // Stereo streams always use the shared block so stateful processors run
+                // once before fan-out. A multichannel device stream uses it only when a
+                // stereo processor is active; otherwise preserve the original channel map.
+                if (inputChannels == 2 || hasActiveStereoProcessing),
+                   let inputData = inputBuffer.mData {
                     let inputSamples = inputData.assumingMemoryBound(to: Float.self)
                     let inputSampleCount = Int(inputBuffer.mDataByteSize) / MemoryLayout<Float>.size
-                    let candidateFrameCount = inputSampleCount / 2
+                    let candidateFrameCount = inputSampleCount / inputChannels
                     // CoreAudio is configured for at most this many frames. If a driver
                     // violates that contract, fall back without truncating/zeroing a tail.
                     if candidateFrameCount > 0,
                        candidateFrameCount <= appProcessingFrameCapacity {
                         sharedProcessingFrameCount = candidateFrameCount
+                        let sourceLeft: Int
+                        let sourceRight: Int
+                        if inputChannels == 1 {
+                            sourceLeft = 0
+                            sourceRight = 0
+                        } else if inputChannels == 2 {
+                            // Preferred indices describe the hardware output and may be
+                            // greater than one even when the tap itself is a stereo mixdown.
+                            sourceLeft = 0
+                            sourceRight = 1
+                        } else {
+                            sourceLeft = min(max(inputStereoLeft, 0), inputChannels - 1)
+                            let requestedRight = min(max(inputStereoRight, 0), inputChannels - 1)
+                            sourceRight = requestedRight == sourceLeft
+                                ? (sourceLeft == 0 ? 1 : 0)
+                                : requestedRight
+                        }
                         for frame in 0..<sharedProcessingFrameCount {
                             currentVol += (targetVol - currentVol) * rampCoefficient
                             let gain = currentVol * crossfadeMultiplier * outputGateMultiplier
-                            let base = frame * 2
-                            appProcessingScratch[base] = inputSamples[base] * gain
-                            appProcessingScratch[base + 1] = inputSamples[base + 1] * gain
+                            let inputBase = frame * inputChannels
+                            let stereoBase = frame * 2
+                            appProcessingScratch[stereoBase] = inputSamples[inputBase + sourceLeft] * gain
+                            appProcessingScratch[stereoBase + 1] = inputSamples[inputBase + sourceRight] * gain
                         }
                         if let eqProc, eqProc.isEnabled {
                             eqProc.process(
@@ -2108,10 +2205,6 @@ final class ProcessTapController: ProcessTapControlling {
                                 frameCount: sharedProcessingFrameCount
                             )
                         }
-                        SoftLimiter.processBuffer(
-                            appProcessingScratch,
-                            sampleCount: sharedProcessingFrameCount * 2
-                        )
                     }
                 }
             }
@@ -2140,32 +2233,74 @@ final class ProcessTapController: ProcessTapControlling {
             }
 
             let usesSharedProcessingBlock = sharedProcessingFrameCount > 0
-            let inputSamples = usesSharedProcessingBlock
+            let rawInputChannels = max(1, Int(inputBuffer.mNumberChannels))
+            let replacesPreferredPairInMultichannel = usesSharedProcessingBlock
+                && rawInputChannels > 2
+                && max(1, Int(outputBuffer.mNumberChannels)) > 2
+            let inputSamples = usesSharedProcessingBlock && !replacesPreferredPairInMultichannel
                 ? appProcessingScratch!
                 : rawInputData.assumingMemoryBound(to: Float.self)
             let outputSamples = outputData.assumingMemoryBound(to: Float.self)
-            let inputChannels = usesSharedProcessingBlock ? 2 : max(1, Int(inputBuffer.mNumberChannels))
+            let inputChannels = usesSharedProcessingBlock && !replacesPreferredPairInMultichannel
+                ? 2
+                : rawInputChannels
             let outputChannels = max(1, Int(outputBuffer.mNumberChannels))
-            let inputSampleCount = usesSharedProcessingBlock
+            let inputSampleCount = usesSharedProcessingBlock && !replacesPreferredPairInMultichannel
                 ? sharedProcessingFrameCount * 2
                 : Int(inputBuffer.mDataByteSize) / MemoryLayout<Float>.size
             let outputSampleCount = Int(outputBuffer.mDataByteSize) / MemoryLayout<Float>.size
             let inputFrameCount = inputSampleCount / inputChannels
             let outputFrameCount = outputSampleCount / outputChannels
-            let frameCount = min(inputFrameCount, outputFrameCount)
+            let mappedFrameCount = min(inputFrameCount, outputFrameCount)
+            // The shared stereo scratch is built from one canonical tap buffer. Other
+            // aggregate buffers should normally have the same frame count, but clamp a
+            // mismatched multichannel destination before reading the shared block.
+            let frameCount = replacesPreferredPairInMultichannel
+                ? min(mappedFrameCount, sharedProcessingFrameCount)
+                : mappedFrameCount
 
             guard frameCount > 0 else {
                 memset(outputData, 0, Int(outputBuffer.mDataByteSize))
                 continue
             }
 
-            let safeLeft = min(max(preferredStereoLeft, 0), max(outputChannels - 1, 0))
-            let safeRight = min(max(preferredStereoRight, 0), max(outputChannels - 1, 0))
+            let safeLeft = min(max(outputStereoLeft, 0), max(outputChannels - 1, 0))
+            let requestedSafeRight = min(max(outputStereoRight, 0), max(outputChannels - 1, 0))
+            let safeRight = outputChannels > 1 && requestedSafeRight == safeLeft
+                ? (safeLeft == 0 ? 1 : 0)
+                : requestedSafeRight
 
             let eq = eqProc  // Parameter read — each callback passes its own processor
             let eqCanProcessStereoInterleaved = (inputChannels == 2 && outputChannels == 2)
 
-            if inputChannels == outputChannels {
+            if replacesPreferredPairInMultichannel {
+                // Preserve every native channel, but replace the device's preferred L/R
+                // pair with the once-processed stereo block. Replaying the same gain ramp
+                // from its initial value avoids advancing shared volume state per output.
+                var replayVolume = sharedProcessingInitialVolume
+                for frame in 0..<frameCount {
+                    replayVolume += (targetVol - replayVolume) * rampCoefficient
+                    let gain = replayVolume * crossfadeMultiplier * outputGateMultiplier
+                    let inputBase = frame * inputChannels
+                    let outputBase = frame * outputChannels
+                    let copiedChannels = min(inputChannels, outputChannels)
+                    for channel in 0..<copiedChannels {
+                        outputSamples[outputBase + channel] = inputSamples[inputBase + channel] * gain
+                    }
+                    if copiedChannels < outputChannels {
+                        for channel in copiedChannels..<outputChannels {
+                            outputSamples[outputBase + channel] = 0
+                        }
+                    }
+                    let stereoBase = frame * 2
+                    outputSamples[outputBase + safeLeft] = appProcessingScratch![stereoBase]
+                    outputSamples[outputBase + safeRight] = appProcessingScratch![stereoBase + 1]
+                }
+                let writtenSamples = frameCount * outputChannels
+                if writtenSamples < outputSampleCount {
+                    memset(outputSamples.advanced(by: writtenSamples), 0, (outputSampleCount - writtenSamples) * MemoryLayout<Float>.size)
+                }
+            } else if inputChannels == outputChannels {
                 let sampleCount = frameCount * inputChannels
                 for frame in 0..<frameCount {
                     if !usesSharedProcessingBlock {
@@ -2281,10 +2416,10 @@ final class ProcessTapController: ProcessTapControlling {
                 loudnessCompensatorProc.process(input: outputSamples, output: outputSamples, frameCount: frameCount)
             }
 
-            if !usesSharedProcessingBlock {
-                let writtenSampleCount = frameCount * outputChannels
-                SoftLimiter.processBuffer(outputSamples, sampleCount: writtenSampleCount)
-            }
+            // The limiter is stateless, so applying it after fan-out keeps every native
+            // multichannel lane protected without advancing any processor more than once.
+            let writtenSampleCount = frameCount * outputChannels
+            SoftLimiter.processBuffer(outputSamples, sampleCount: writtenSampleCount)
         }
     }
 
@@ -2399,23 +2534,11 @@ final class ProcessTapController: ProcessTapControlling {
             return
         }
 
-        // Track peak level for VU meter
-        var maxPeak: Float = 0.0
-        var totalSamplesThisBuffer: Int = 0
-        for inputBuffer in inputBuffers {
-            guard let inputData = inputBuffer.mData else { continue }
-            let inputSamples = inputData.assumingMemoryBound(to: Float.self)
-            let channels = max(1, Int(inputBuffer.mNumberChannels))
-            let sampleCount = Int(inputBuffer.mDataByteSize) / MemoryLayout<Float>.size
-            if totalSamplesThisBuffer == 0 {
-                totalSamplesThisBuffer = sampleCount / channels
-            }
-            for i in stride(from: 0, to: sampleCount, by: channels) {
-                let absSample = abs(inputSamples[i])
-                if absSample > maxPeak { maxPeak = absSample }
-            }
-        }
-        let rawPeak = min(maxPeak, 1.0)
+        // Track peak level for the VU meter and output gate across every input channel.
+        // A multichannel tap's preferred L/R pair is not necessarily channel 0/1.
+        let inputMeasurement = Self.measureInputBuffers(inputBuffers)
+        let rawPeak = inputMeasurement.peak
+        let totalSamplesThisBuffer = inputMeasurement.frameCount
 
         if isPrimary {
             _peakLevel = _peakLevel + levelSmoothingFactor * (rawPeak - _peakLevel)
@@ -2477,8 +2600,10 @@ final class ProcessTapController: ProcessTapControlling {
         var currentVol: Float
         let crossfadeMultiplier: Float
         let rampCoeff: Float
-        let stereoLeft: Int
-        let stereoRight: Int
+        let inputStereoLeft: Int
+        let inputStereoRight: Int
+        let outputStereoLeft: Int
+        let outputStereoRight: Int
         let eqProc: EQProcessor?
         let autoEQProc: AutoEQProcessor?
         let loudnessEqualizerProc: LoudnessEqualizer?
@@ -2493,8 +2618,10 @@ final class ProcessTapController: ProcessTapControlling {
             // race condition guard (returns 0.0 when progress >= 1.0 in idle phase).
             crossfadeMultiplier = crossfadeState.primaryMultiplier
             rampCoeff = rampCoefficient
-            stereoLeft = _primaryPreferredStereoLeftChannel
-            stereoRight = _primaryPreferredStereoRightChannel
+            inputStereoLeft = _primaryTapStereoLeftChannel
+            inputStereoRight = _primaryTapStereoRightChannel
+            outputStereoLeft = _primaryOutputStereoLeftChannel
+            outputStereoRight = _primaryOutputStereoRightChannel
             eqProc = eqProcessor
             autoEQProc = autoEQProcessor
             loudnessEqualizerProc = loudnessEqualizerProcessor
@@ -2517,8 +2644,10 @@ final class ProcessTapController: ProcessTapControlling {
             // .warmingUp → 0.0 (muted), .crossfading → sin(progress*π/2), .idle → 1.0
             crossfadeMultiplier = crossfadeState.secondaryMultiplier
             rampCoeff = secondaryRampCoefficient
-            stereoLeft = _secondaryPreferredStereoLeftChannel
-            stereoRight = _secondaryPreferredStereoRightChannel
+            inputStereoLeft = _secondaryTapStereoLeftChannel
+            inputStereoRight = _secondaryTapStereoRightChannel
+            outputStereoLeft = _secondaryOutputStereoLeftChannel
+            outputStereoRight = _secondaryOutputStereoRightChannel
             eqProc = secondaryEQProcessor
             autoEQProc = secondaryAutoEQProcessor
             loudnessEqualizerProc = secondaryLoudnessEqualizerProcessor
@@ -2549,8 +2678,10 @@ final class ProcessTapController: ProcessTapControlling {
             crossfadeMultiplier: crossfadeMultiplier,
             outputGateMultiplier: outputGateMultiplier,
             rampCoefficient: rampCoeff,
-            preferredStereoLeft: stereoLeft,
-            preferredStereoRight: stereoRight,
+            inputStereoLeft: inputStereoLeft,
+            inputStereoRight: inputStereoRight,
+            outputStereoLeft: outputStereoLeft,
+            outputStereoRight: outputStereoRight,
             currentVol: &currentVol,
             eqProc: eqProc,
             autoEQProc: autoEQProc,
