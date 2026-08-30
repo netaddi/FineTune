@@ -42,6 +42,9 @@ nonisolated struct EQSettings: Codable, Equatable {
         bandGains.map { $0.isFinite ? max(Self.minGainDB, min(Self.maxGainDB, $0)) : 0 }
     }
 
-    /// Flat EQ preset
+    /// Flat EQ preset for callers that explicitly want processing enabled.
     static let flat = EQSettings()
+
+    /// Per-app fallback used before the user explicitly enables the built-in EQ.
+    static let disabledFlat = EQSettings(isEnabled: false)
 }

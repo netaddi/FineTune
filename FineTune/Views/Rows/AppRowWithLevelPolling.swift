@@ -80,7 +80,7 @@ struct AppRowWithLevelPolling: View {
         onDeviceModeChange: @escaping (DeviceSelectionMode) -> Void = { _ in },
         onSelectFollowDefault: @escaping () -> Void = {},
         onAppActivate: @escaping () -> Void = {},
-        eqSettings: EQSettings = EQSettings(),
+        eqSettings: EQSettings = .disabledFlat,
         userPresets: [UserEQPreset] = [],
         onEQChange: @escaping (EQSettings) -> Void = { _ in },
         onUserPresetSelected: @escaping (UserEQPreset) -> Void = { _ in },

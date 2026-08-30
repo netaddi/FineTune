@@ -80,7 +80,7 @@ struct InactiveAppRow: View {
         onDevicesSelected: @escaping (Set<String>) -> Void = { _ in },
         onDeviceModeChange: @escaping (DeviceSelectionMode) -> Void = { _ in },
         onSelectFollowDefault: @escaping () -> Void = {},
-        eqSettings: EQSettings = EQSettings(),
+        eqSettings: EQSettings = .disabledFlat,
         userPresets: [UserEQPreset] = [],
         onEQChange: @escaping (EQSettings) -> Void = { _ in },
         onUserPresetSelected: @escaping (UserEQPreset) -> Void = { _ in },

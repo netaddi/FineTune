@@ -234,6 +234,40 @@ struct SettingsJSONTests {
     }
 }
 
+// MARK: - Per-App EQ Defaults
+
+@Suite("SettingsManager — per-app EQ defaults", .serialized)
+@MainActor
+struct AppEQDefaultTests {
+    @Test("An app without persisted EQ settings defaults to disabled flat EQ")
+    func missingAppEQDefaultsOff() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneAppEQDefaultTests-\(UUID().uuidString)")
+        let manager = SettingsManager(directory: directory)
+
+        let eq = manager.getEQSettings(for: "com.test.new-audio-app")
+
+        #expect(eq == .disabledFlat)
+        #expect(!eq.isEnabled)
+        #expect(eq.bandGains.allSatisfy { $0 == 0 })
+    }
+
+    @Test("An explicit enabled EQ setting remains enabled")
+    func explicitEnabledEQIsPreserved() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneAppEQExplicitTests-\(UUID().uuidString)")
+        let manager = SettingsManager(directory: directory)
+        let enabled = EQSettings(
+            bandGains: [3, 2, 1, 0, 0, 0, 0, 0, 0, 0],
+            isEnabled: true
+        )
+
+        manager.setEQSettings(enabled, for: "com.test.enabled-audio-app")
+
+        #expect(manager.getEQSettings(for: "com.test.enabled-audio-app") == enabled)
+    }
+}
+
 // MARK: - Persistent Mixer Strip Slots
 
 @Suite("SettingsManager — persistent mixer strip slots", .serialized)

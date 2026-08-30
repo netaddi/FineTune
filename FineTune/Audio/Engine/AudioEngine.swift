@@ -719,7 +719,7 @@ final class AudioEngine {
     // MARK: - Settings Reset
 
     /// Resets all persisted settings and synchronizes in-memory engine state.
-    /// Active taps are kept alive but reverted to defaults (unity volume, unmuted, flat EQ).
+    /// Active taps are kept alive but reverted to defaults (unity volume, unmuted, disabled flat EQ).
     func handleSettingsReset() {
         // Close plugin views while their hosts are still valid. Window close callbacks save
         // live state first; resetAllSettings below then deliberately clears that state.
@@ -742,7 +742,7 @@ final class AudioEngine {
         // 5. Push defaults to all active taps
         for tap in taps.values {
             applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: tap.currentDeviceUIDs)
-            tap.updateEQSettings(.flat)
+            tap.updateEQSettings(.disabledFlat)
             tap.updateAutoEQProfile(nil)
             tap.attachPersistentAUEffectChain(nil, entries: [])
             tap.updateDeviceAUEffectChain([])

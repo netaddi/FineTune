@@ -598,6 +598,17 @@ struct AudioEngineTapInitialStateTests {
         #expect(snap.eqSettings == custom)
     }
 
+    @Test("An app without EQ settings starts with the built-in EQ disabled")
+    func defaultEQIsDisabled() throws {
+        let fix = makeFixture()
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+
+        let snap = try #require(capturedInitial(fix))
+        #expect(snap.eqSettings == .disabledFlat)
+        #expect(!snap.eqSettings.isEnabled)
+    }
+
     @Test("autoEQPreampEnabled mirrors settingsManager.autoEQPreampEnabled",
           arguments: [true, false])
     func autoEQPreampEnabledMirrored(value: Bool) throws {
@@ -881,7 +892,7 @@ struct RecordingProcessTapControllerContractTests {
             #expect(snap.loudnessCompensationEnabled == false)
             #expect(snap.loudnessEqualizerSettings.enabled == false)
             #expect(snap.autoEQPreampEnabled == false)
-            #expect(snap.eqSettings == EQSettings.flat)
+            #expect(snap.eqSettings == EQSettings.disabledFlat)
             #expect(snap.loudnessVolume == 1.0)
         } else {
             Issue.record("activate() did not record an .activate event")

@@ -363,7 +363,7 @@ final class SettingsManager {
     }
 
     func getEQSettings(for appIdentifier: String) -> EQSettings {
-        return settings.appEQSettings[appIdentifier] ?? EQSettings.flat
+        return settings.appEQSettings[appIdentifier] ?? EQSettings.disabledFlat
     }
 
     func setEQSettings(_ eqSettings: EQSettings, for appIdentifier: String) {
