@@ -299,6 +299,22 @@ struct CrossfadeProgressTests {
         #expect(state.isCrossfadeComplete, "Should be complete at exactly 1.0")
     }
 
+    @Test("Forced crossfade progress cannot promote a secondary that never warmed up")
+    func forcedProgressDoesNotBypassWarmup() {
+        var state = CrossfadeState()
+        state.beginWarmup()
+        state.totalSamples = Int64(CrossfadeState.minimumWarmupSamples)
+        state.beginCrossfading()
+        state.progress = 1.0
+
+        #expect(state.isCrossfadeComplete)
+        #expect(!state.isWarmupComplete)
+        #expect(!state.isReadyForPromotion)
+
+        _ = state.updateProgress(samples: CrossfadeState.minimumWarmupSamples)
+        #expect(state.isReadyForPromotion)
+    }
+
     @Test("Normal crossfade timing: progress reaches 1.0 at totalSamples")
     func crossfadeTiming() {
         var state = CrossfadeState()

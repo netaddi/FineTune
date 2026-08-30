@@ -316,10 +316,7 @@ struct SettingsMigrationV10toV11Tests {
         let data = Data(v10JsonWithLegacyKey.utf8)
         let decoded = try JSONDecoder().decode(SettingsManager.Settings.self, from: data)
 
-        // Version from the JSON is preserved (migration happens on next save via the
-        // struct default of 11). The field we care about is that AppSettings no longer
-        // has `softwareDeviceVolumeEnabled`, so decoding doesn't throw.
-        #expect(decoded.version == 10)
+        #expect(decoded.version == 13)
         #expect(decoded.deviceVolumeTierOverride.isEmpty == true)
         #expect(decoded.appSettings.lockInputDevice == true)
         #expect(decoded.appSettings.showDeviceDisconnectAlerts == true)
@@ -328,10 +325,10 @@ struct SettingsMigrationV10toV11Tests {
         #expect(decoded.softwareDeviceSavedVolumes.isEmpty)
     }
 
-    @Test("Re-encode after v10 decode bumps to v12 on a fresh Settings instance")
-    func defaultSettingsVersionIsTwelve() {
+    @Test("Re-encode after v10 decode bumps to v13 on a fresh Settings instance")
+    func defaultSettingsVersionIsThirteen() {
         let fresh = SettingsManager.Settings()
-        #expect(fresh.version == 12)
+        #expect(fresh.version == 13)
         #expect(fresh.deviceVolumeTierOverride.isEmpty)
     }
 
@@ -384,7 +381,7 @@ struct SettingsMigrationV10toV11Tests {
         }
         """#
         let decoded = try JSONDecoder().decode(SettingsManager.Settings.self, from: Data(json.utf8))
-        #expect(decoded.version == 11)
+        #expect(decoded.version == 13)
         #expect(decoded.deviceVolumeTierOverride["uid-usb-interface"] == .software)
         #expect(decoded.deviceVolumeTierOverride["uid-external-display"] == .ddc)
         #expect(decoded.softwareDeviceVolumes["uid-usb-interface"] == 0.6)
@@ -461,4 +458,3 @@ struct DeviceVolumeStoredVolumeTests {
         #expect(stored > 0, "\(step) software step-up stuck at silence — issue #295 regression")
     }
 }
-

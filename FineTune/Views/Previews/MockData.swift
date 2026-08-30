@@ -3,6 +3,7 @@ import AppKit
 import AudioToolbox
 
 /// Mock data for SwiftUI previews
+@MainActor
 enum MockData {
 
     // MARK: - Sample Apps

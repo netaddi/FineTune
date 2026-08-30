@@ -7,6 +7,7 @@ struct AUPluginPickerMenu: View {
     let getCrashHistory: () -> Set<String>
     let onPluginSelected: (AUPluginDescriptor) -> Void
     let onToggleFavorite: (String) -> Void
+    var allowsPlugin: (AUPluginDescriptor) -> Bool = { _ in true }
 
     @State private var isExpanded = false
     @State private var isButtonHovered = false
@@ -46,7 +47,8 @@ struct AUPluginPickerMenu: View {
                         onPluginSelected(plugin)
                         isExpanded = false
                     },
-                    onToggleFavorite: onToggleFavorite
+                    onToggleFavorite: onToggleFavorite,
+                    allowsPlugin: allowsPlugin
                 )
             }
         )
@@ -63,26 +65,29 @@ private struct AUPluginPickerPopover: View {
     let crashHistory: Set<String>
     let onPluginSelected: (AUPluginDescriptor) -> Void
     let onToggleFavorite: (String) -> Void
+    let allowsPlugin: (AUPluginDescriptor) -> Bool
 
     @State private var favoriteIDs: Set<String>
     @State private var searchText = ""
 
     private let popoverWidth: CGFloat = 280
 
-    init(scanner: AUPluginScanner, getFavoriteIDs: () -> Set<String>, getCrashHistory: () -> Set<String>, onPluginSelected: @escaping (AUPluginDescriptor) -> Void, onToggleFavorite: @escaping (String) -> Void) {
+    init(scanner: AUPluginScanner, getFavoriteIDs: () -> Set<String>, getCrashHistory: () -> Set<String>, onPluginSelected: @escaping (AUPluginDescriptor) -> Void, onToggleFavorite: @escaping (String) -> Void, allowsPlugin: @escaping (AUPluginDescriptor) -> Bool) {
         self.scanner = scanner
         let favs = getFavoriteIDs()
         self.initialFavoriteIDs = favs
         self.crashHistory = getCrashHistory()
         self.onPluginSelected = onPluginSelected
         self.onToggleFavorite = onToggleFavorite
+        self.allowsPlugin = allowsPlugin
         self._favoriteIDs = State(initialValue: favs)
     }
 
     private var filteredPlugins: [AUPluginDescriptor] {
-        if searchText.isEmpty { return scanner.plugins }
+        let allowed = scanner.plugins.filter(allowsPlugin)
+        if searchText.isEmpty { return allowed }
         let query = searchText.lowercased()
-        return scanner.plugins.filter {
+        return allowed.filter {
             $0.name.lowercased().contains(query) || $0.manufacturer.lowercased().contains(query)
         }
     }

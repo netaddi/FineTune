@@ -191,6 +191,13 @@ final class VolumeState {
         states.removeValue(forKey: pid)
     }
 
+    /// Remove every in-memory state entry for one logical app. A logical app can
+    /// temporarily have more than one PID during relaunch, so PID-only cleanup is
+    /// insufficient when the user chooses to ignore the app.
+    func removeStates(for identifier: String) {
+        states = states.filter { $0.value.persistenceIdentifier != identifier }
+    }
+
     func cleanup(keeping pids: Set<pid_t>) {
         states = states.filter { pids.contains($0.key) }
     }

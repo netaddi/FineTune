@@ -46,7 +46,10 @@ struct AudioEngineToggleMuteTests {
         let engine = AudioEngine(
             permission: AudioRecordingPermission(),
             settingsManager: settings,
-            autoEQProfileManager: AutoEQProfileManager(),
+            autoEQProfileManager: AutoEQProfileManager(
+                loadPersistedProfiles: false,
+                loadCatalog: false
+            ),
             deviceProvider: deviceMonitor,
             deviceVolumeMonitor: mockVolume,
             startMonitorsAutomatically: false

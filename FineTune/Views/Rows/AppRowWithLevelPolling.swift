@@ -34,6 +34,9 @@ struct AppRowWithLevelPolling: View {
     let isEQExpanded: Bool
     let onEQToggle: () -> Void
     let isFocused: Bool
+    let mixerStripSlot: Int?
+    let mixerStripSlotCount: Int
+    let onMixerStripSlotChange: (Int) -> Void
 
     // AU effect chain passthrough
     let auEffectChain: [AUEffectChainEntry]
@@ -87,6 +90,9 @@ struct AppRowWithLevelPolling: View {
         isEQExpanded: Bool = false,
         onEQToggle: @escaping () -> Void = {},
         isFocused: Bool = false,
+        mixerStripSlot: Int? = nil,
+        mixerStripSlotCount: Int = 1,
+        onMixerStripSlotChange: @escaping (Int) -> Void = { _ in },
         auEffectChain: [AUEffectChainEntry] = [],
         isAUChainBypassed: Bool = false,
         auPluginScanner: AUPluginScanner? = nil,
@@ -134,6 +140,9 @@ struct AppRowWithLevelPolling: View {
         self.isEQExpanded = isEQExpanded
         self.onEQToggle = onEQToggle
         self.isFocused = isFocused
+        self.mixerStripSlot = mixerStripSlot
+        self.mixerStripSlotCount = mixerStripSlotCount
+        self.onMixerStripSlotChange = onMixerStripSlotChange
         self.auEffectChain = auEffectChain
         self.isAUChainBypassed = isAUChainBypassed
         self.auPluginScanner = auPluginScanner
@@ -183,6 +192,9 @@ struct AppRowWithLevelPolling: View {
             isEQExpanded: isEQExpanded,
             onEQToggle: onEQToggle,
             isFocused: isFocused,
+            mixerStripSlot: mixerStripSlot,
+            mixerStripSlotCount: mixerStripSlotCount,
+            onMixerStripSlotChange: onMixerStripSlotChange,
             auEffectChain: auEffectChain,
             isAUChainBypassed: isAUChainBypassed,
             auPluginScanner: auPluginScanner,

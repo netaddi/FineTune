@@ -5,6 +5,35 @@ import KeyboardShortcuts
 import os
 
 @MainActor
+protocol ShortcutRegistering: AnyObject {
+    func setShortcut(_ shortcut: KeyboardShortcuts.Shortcut?, for name: KeyboardShortcuts.Name)
+    func onKeyDown(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void)
+    func onKeyUp(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void)
+}
+
+@MainActor
+final class SystemShortcutRegistrar: ShortcutRegistering {
+    func setShortcut(_ shortcut: KeyboardShortcuts.Shortcut?, for name: KeyboardShortcuts.Name) {
+        KeyboardShortcuts.setShortcut(shortcut, for: name)
+    }
+
+    func onKeyDown(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {
+        KeyboardShortcuts.onKeyDown(for: name) { action() }
+    }
+
+    func onKeyUp(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {
+        KeyboardShortcuts.onKeyUp(for: name) { action() }
+    }
+}
+
+@MainActor
+final class NoopShortcutRegistrar: ShortcutRegistering {
+    func setShortcut(_ shortcut: KeyboardShortcuts.Shortcut?, for name: KeyboardShortcuts.Name) {}
+    func onKeyDown(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {}
+    func onKeyUp(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {}
+}
+
+@MainActor
 protocol AudioEngineDispatching: AnyObject {
     var apps: [AudioApp] { get }
     func setVolume(for app: AudioApp, to volume: Float)
@@ -52,6 +81,7 @@ final class ShortcutsRegistry {
     private let resolver: any TargetAppResolving
     private let audioEngine: any AudioEngineDispatching
     private let hud: any PerAppHUDPresenting
+    private let shortcutRegistrar: any ShortcutRegistering
     private var didStart = false
 
     /// Software-emulated key-repeat timing. Carbon hot keys don't auto-repeat,
@@ -66,13 +96,15 @@ final class ShortcutsRegistry {
         popupController: any MenuBarPopupControlling,
         resolver: any TargetAppResolving,
         audioEngine: any AudioEngineDispatching,
-        hud: any PerAppHUDPresenting
+        hud: any PerAppHUDPresenting,
+        shortcutRegistrar: any ShortcutRegistering = SystemShortcutRegistrar()
     ) {
         self.settings = settings
         self.popupController = popupController
         self.resolver = resolver
         self.audioEngine = audioEngine
         self.hud = hud
+        self.shortcutRegistrar = shortcutRegistrar
     }
 
     /// Stable `KeyboardShortcuts.Name` per action. The raw string is part of
@@ -176,23 +208,30 @@ final class ShortcutsRegistry {
         guard !didStart else { return }
         didStart = true
 
+        synchronizeShortcutsFromSettings()
+
         for action in ShortcutAction.allCases {
             let actionName = name(for: action)
 
-            if let codable = settings.appSettings.customShortcuts[action.rawValue] {
-                KeyboardShortcuts.setShortcut(codable.keyboardShortcut, for: actionName)
-            }
-
-            KeyboardShortcuts.onKeyDown(for: actionName) { [weak self] in
+            shortcutRegistrar.onKeyDown(for: actionName) { [weak self] in
                 self?.dispatch(action)
                 self?.startRepeating(action: action)
             }
-            KeyboardShortcuts.onKeyUp(for: actionName) { [weak self] in
+            shortcutRegistrar.onKeyUp(for: actionName) { [weak self] in
                 self?.stopRepeating(action: action)
             }
         }
 
         Self.logger.debug("ShortcutsRegistry started; \(ShortcutAction.allCases.count) action(s) registered")
+    }
+
+    /// Makes settings.json authoritative even for cleared shortcuts. Passing `nil` is
+    /// required to remove an older value retained by KeyboardShortcuts/UserDefaults.
+    func synchronizeShortcutsFromSettings() {
+        for action in ShortcutAction.allCases {
+            let shortcut = settings.appSettings.customShortcuts[action.rawValue]?.keyboardShortcut
+            shortcutRegistrar.setShortcut(shortcut, for: name(for: action))
+        }
     }
 
     /// Returns a closure suitable for `KeyboardShortcuts.Recorder(for:onChange:)`.

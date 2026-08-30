@@ -25,6 +25,7 @@ struct SettingsRootView: View {
                 settings: settings,
                 onResetAll: {
                     audioEngine.handleSettingsReset()
+                    shortcutsRegistry.synchronizeShortcutsFromSettings()
                     deviceVolumeMonitor.setSystemFollowDefault()
                 }
             )

@@ -3,9 +3,17 @@ import SwiftUI
 import UserNotifications
 import FluidMenuBarExtra
 import AppKit
+import Darwin
 import os
 
 private let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "App")
+
+private var isRunningHostedTests: Bool {
+    let environment = ProcessInfo.processInfo.environment
+    return environment["XCTestConfigurationFilePath"] != nil
+        || environment["SWIFT_TESTING_ENABLED"] != nil
+        || Bundle.allBundles.contains { $0.bundleURL.pathExtension == "xctest" }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -50,7 +58,7 @@ struct FineTuneApp: App {
     @State private var menuBarPopupController: MenuBarPopupController
     @State private var shortcutsRegistry: ShortcutsRegistry
     @State private var resolver: TargetAppResolver
-    @StateObject private var updateManager = UpdateManager()
+    @StateObject private var updateManager: UpdateManager
     @State private var auPluginScanner = AUPluginScanner()
     @State private var showMenuBarExtra = true
 
@@ -103,24 +111,51 @@ struct FineTuneApp: App {
     }
 
     init() {
-        // Install crash handler to clean up aggregate devices on abnormal exit
-        CrashGuard.install()
-        // Destroy any orphaned aggregate devices from previous crashes
-        OrphanedTapCleanup.destroyOrphanedDevices()
+        let testMode = isRunningHostedTests
+        _updateManager = StateObject(wrappedValue: UpdateManager(startUpdater: !testMode))
+        if !testMode {
+            // Install crash handler to clean up aggregate devices on abnormal exit
+            CrashGuard.install()
+            // Destroy any orphaned aggregate devices from previous crashes
+            OrphanedTapCleanup.destroyOrphanedDevices()
+        }
 
         // Check for AU plugins that were active during a previous crash
         let scanner = AUPluginScanner()
-        let crashedPlugins = CrashGuard.readAndClearCrashPlugins(knownPluginIDs: scanner.plugins.map(\.id))
+        let crashedPlugins = testMode
+            ? Set<String>()
+            : CrashGuard.readCrashPlugins(knownPluginIDs: scanner.plugins.map(\.id))
         _auPluginScanner = State(initialValue: scanner)
 
-        let settings = SettingsManager()
+        let testSettingsDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneHostedTests-\(UUID().uuidString)")
+        let settings = SettingsManager(directory: testMode ? testSettingsDirectory : nil)
         if !crashedPlugins.isEmpty {
             settings.markAUPluginsActiveAtCrash(crashedPlugins)
             settings.disableCrashedAUPlugins(crashedPlugins)
         }
-        let profileManager = AutoEQProfileManager()
+        if !testMode {
+            // A crash marker is a two-phase record: do not acknowledge it until the
+            // matching quarantine/history is durable. Otherwise a second startup crash
+            // inside the debounce window can resurrect the original crash-loop plugin.
+            let quarantineIsDurable = crashedPlugins.isEmpty || settings.flushSync()
+            if quarantineIsDurable {
+                CrashGuard.clearCrashPlugins()
+            } else {
+                logger.error("Could not persist AU quarantine; retaining crash marker")
+            }
+        }
+        let profileManager = AutoEQProfileManager(
+            loadPersistedProfiles: !testMode,
+            loadCatalog: !testMode
+        )
         let permission = AudioRecordingPermission()
-        let engine = AudioEngine(permission: permission, settingsManager: settings, autoEQProfileManager: profileManager)
+        let engine = AudioEngine(
+            permission: permission,
+            settingsManager: settings,
+            autoEQProfileManager: profileManager,
+            startMonitorsAutomatically: !testMode
+        )
         engine.loadAUMetadataFromSettings()
         _audioEngine = State(initialValue: engine)
 
@@ -180,7 +215,9 @@ struct FineTuneApp: App {
         )
         monitor.iconCoordinator = coordinator
         // Defer start() so NSApplication.shared is fully bootstrapped before we walk NSApp.windows.
-        DispatchQueue.main.async { [coordinator] in coordinator.start() }
+        if !testMode {
+            DispatchQueue.main.async { [coordinator] in coordinator.start() }
+        }
         _iconCoordinator = State(initialValue: coordinator)
 
         // Render the scene's first frame with the user's chosen style instead of a generic
@@ -208,11 +245,13 @@ struct FineTuneApp: App {
         // the monitor to reconcile its tap state whenever trust changes — this
         // is the single source of truth for retroactive start/stop (a `.onChange`
         // inside MenuBarPopupView would miss flips when the popup is closed).
-        accessibilityService.onTrustChanged = { [weak monitor] _ in
-            monitor?.reconcile()
+        if !testMode {
+            accessibilityService.onTrustChanged = { [weak monitor] _ in
+                monitor?.reconcile()
+            }
+            accessibilityService.start()
+            monitor.reconcile()
         }
-        accessibilityService.start()
-        monitor.reconcile()
 
         // Global hotkeys (KeyboardShortcuts SPM, Carbon-backed; no Accessibility
         // permission required for the hotkey itself). Registry start() is deferred
@@ -222,13 +261,14 @@ struct FineTuneApp: App {
         let resolver = TargetAppResolver(
             ownBundleID: Bundle.main.bundleIdentifier ?? "com.finetuneapp.FineTune"
         )
-        resolver.start()
+        if !testMode { resolver.start() }
         let registry = ShortcutsRegistry(
             settings: settings,
             popupController: popupController,
             resolver: resolver,
             audioEngine: engine,
-            hud: hud
+            hud: hud,
+            shortcutRegistrar: testMode ? NoopShortcutRegistrar() : SystemShortcutRegistrar()
         )
         _menuBarPopupController = State(initialValue: popupController)
         _shortcutsRegistry = State(initialValue: registry)
@@ -237,7 +277,7 @@ struct FineTuneApp: App {
         // Pass engine to AppDelegate
         _appDelegate.wrappedValue.audioEngine = engine
 
-        if permission.status == .unknown {
+        if !testMode, permission.status == .unknown {
             permission.request()
         }
 
@@ -245,17 +285,25 @@ struct FineTuneApp: App {
         // This ensures proper initialization order: deviceMonitor.start() -> deviceVolumeMonitor.start()
 
         // Set delegate before requesting authorization so willPresent is called
-        UNUserNotificationCenter.current().delegate = _appDelegate.wrappedValue
+        if !testMode {
+            UNUserNotificationCenter.current().delegate = _appDelegate.wrappedValue
 
-        // Request notification authorization (for device disconnect alerts)
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, error in
-            if let error {
-                logger.error("Notification authorization error: \(error.localizedDescription)")
+            // Request notification authorization (for device disconnect alerts)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, error in
+                if let error {
+                    logger.error("Notification authorization error: \(error.localizedDescription)")
+                }
+                // If not granted, notifications will silently not appear - acceptable behavior
             }
-            // If not granted, notifications will silently not appear - acceptable behavior
         }
 
-        // Flush debounced settings + tear down the CGEventTap before dealloc.
+        // Flush debounced settings and synchronously retire HAL resources before exit.
+        // Some in-process third-party AUs (including Console 1 2.6.30) start background
+        // threads whose C++ global destructors race one another during normal exit(3).
+        // After all FineTune-owned state/resources are clean, _exit(2) is the only reliable
+        // way to avoid executing foreign image finalizers. Hosted tests keep normal process
+        // semantics so a synthetic termination notification cannot kill the test runner.
+        let shouldBypassThirdPartyExitFinalizers = !testMode
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -263,11 +311,19 @@ struct FineTuneApp: App {
         ) { [settings, engine, monitor, accessibilityService, hud, coordinator] _ in
             MainActor.assumeIsolated {
                 engine.saveAllLiveAUState()
+                // Persist the authoritative live AU snapshots before any HAL join. A
+                // misbehaving device/plug-in must not make the only durable write depend
+                // on teardown returning. Flush again below for stop-time mutations.
+                _ = settings.flushSync()
                 coordinator.stop()
                 monitor.stop()
                 accessibilityService.stop()
                 hud.shutdown()
-                settings.flushSync()
+                engine.prepareForProcessExit()
+                _ = settings.flushSync()
+                if shouldBypassThirdPartyExitFinalizers {
+                    Darwin._exit(EXIT_SUCCESS)
+                }
             }
         }
     }

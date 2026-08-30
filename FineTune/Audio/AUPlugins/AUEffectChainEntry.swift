@@ -7,6 +7,9 @@ struct AUEffectChainEntry: Codable, Identifiable, Equatable {
     var isEnabled: Bool
     var presetData: Data?
     var selectedFactoryPresetIndex: Int?
+    /// Distinguishes crash-loop quarantine from the ordinary user bypass toggle.
+    /// Optional keeps settings written before this field backward-compatible.
+    var isCrashQuarantined: Bool?
 
     init(plugin: AUPluginDescriptor, isEnabled: Bool = true) {
         self.id = UUID()
@@ -14,6 +17,30 @@ struct AUEffectChainEntry: Codable, Identifiable, Equatable {
         self.isEnabled = isEnabled
         self.presetData = nil
         self.selectedFactoryPresetIndex = nil
+        self.isCrashQuarantined = nil
+    }
+
+    var isConsole1TrackEligible: Bool {
+        pluginDescriptor.isSoftubeConsole1 && isCrashQuarantined != true
+    }
+
+    func shouldInstantiateOnColdStart(retainingDisabledConsole: Bool) -> Bool {
+        isCrashQuarantined != true
+            && (isEnabled || (retainingDisabledConsole && pluginDescriptor.isSoftubeConsole1))
+    }
+
+    /// Merges a live ClassInfo snapshot without erasing the user's Default/factory
+    /// selection when the Audio Unit has not actually changed since that selection.
+    /// Returning the original value also lets editor polling avoid redundant writes.
+    func mergingLivePresetData(
+        _ livePresetData: Data,
+        matchesLastAppliedPreset: Bool
+    ) -> AUEffectChainEntry {
+        guard !matchesLastAppliedPreset else { return self }
+        var updated = self
+        updated.presetData = livePresetData
+        updated.selectedFactoryPresetIndex = nil
+        return updated
     }
 }
 

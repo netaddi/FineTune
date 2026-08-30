@@ -92,15 +92,48 @@ jobs:
             archive \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID"
 
-      - name: Export archive
+      - name: Export archive and verify signed app
         run: |
           xcodebuild -exportArchive \
             -archivePath build/FineTune.xcarchive \
             -exportPath build/ \
             -exportOptionsPlist ExportOptions.plist
 
-          # Verify the app is signed
-          codesign -dv --verbose=4 build/FineTune.app
+          # Console 1 and other third-party AUv2 plug-ins are loaded in-process, so the
+          # exported Hardened Runtime app must retain the library-validation exception.
+          # Verify the artifact itself rather than relying on the Xcode target setting.
+          codesign --verify --deep --strict --verbose=2 build/FineTune.app
+          codesign -dv --verbose=4 build/FineTune.app 2>&1 \
+            | tee "$RUNNER_TEMP/FineTune.codesign.txt"
+          grep -Eq 'flags=.*runtime' "$RUNNER_TEMP/FineTune.codesign.txt"
+
+          codesign -d --entitlements :- build/FineTune.app \
+            > "$RUNNER_TEMP/FineTune.entitlements.plist"
+          plutil -lint "$RUNNER_TEMP/FineTune.entitlements.plist"
+          test "$(/usr/libexec/PlistBuddy \
+            -c 'Print :com.apple.security.cs.disable-library-validation' \
+            "$RUNNER_TEMP/FineTune.entitlements.plist")" = "true"
+
+          # Launch the exported app directly so a dyld/library-validation failure cannot
+          # hide behind a successful archive or codesign inspection.
+          APP_LOG="$RUNNER_TEMP/FineTune-launch.log"
+          build/FineTune.app/Contents/MacOS/FineTune >"$APP_LOG" 2>&1 &
+          APP_PID=$!
+          cleanup_app() {
+            if kill -0 "$APP_PID" 2>/dev/null; then
+              kill -TERM "$APP_PID"
+            fi
+            wait "$APP_PID" 2>/dev/null || true
+          }
+          trap cleanup_app EXIT
+          sleep 5
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            cat "$APP_LOG"
+            echo "Exported FineTune.app exited during launch smoke test" >&2
+            exit 1
+          fi
+          cleanup_app
+          trap - EXIT
 
       - name: Create DMG
         run: |

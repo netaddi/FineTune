@@ -24,6 +24,15 @@ struct AUPluginDescriptor: Codable, Identifiable, Equatable, Hashable {
         )
     }
 
+    /// Softube Console 1's stable Audio Component identity (`aufx/ScPi/SfTb`).
+    /// Names are localized and may change between releases, so track ordering must use
+    /// the component codes rather than a display-name substring.
+    var isSoftubeConsole1: Bool {
+        componentType == kAudioUnitType_Effect
+            && componentSubType == 0x5363_5069
+            && componentManufacturer == 0x5366_5462
+    }
+
     init(componentType: UInt32, componentSubType: UInt32, componentManufacturer: UInt32, name: String, manufacturer: String, version: UInt32) {
         self.componentType = componentType
         self.componentSubType = componentSubType

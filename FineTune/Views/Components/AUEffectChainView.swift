@@ -17,6 +17,7 @@ struct AUEffectChainView: View {
     var failedEntryIDs: Set<UUID> = []
     var getFactoryPresets: ((UUID) -> [(index: Int, name: String)])? = nil
     var onSelectFactoryPreset: ((UUID, Int) -> Void)? = nil
+    var allowsPlugin: (AUPluginDescriptor) -> Bool = { _ in true }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -54,7 +55,8 @@ struct AUEffectChainView: View {
                 getFavoriteIDs: getFavoriteIDs,
                 getCrashHistory: getCrashHistory,
                 onPluginSelected: onAddEffect,
-                onToggleFavorite: onToggleFavorite
+                onToggleFavorite: onToggleFavorite,
+                allowsPlugin: allowsPlugin
             )
         }
         .padding(.top, entries.isEmpty ? 0 : DesignTokens.Spacing.sm)
@@ -108,7 +110,7 @@ struct AUEffectChainView: View {
                         Button {
                             onSelect(entry.id, -1)
                         } label: {
-                            if entry.selectedFactoryPresetIndex == nil {
+                            if entry.selectedFactoryPresetIndex == nil && entry.presetData == nil {
                                 Label("Default", systemImage: "checkmark")
                             } else {
                                 Text("Default")

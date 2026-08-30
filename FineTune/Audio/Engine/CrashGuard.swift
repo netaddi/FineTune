@@ -14,6 +14,7 @@ private nonisolated let gMaxDeviceSlots = 64
 
 // AU plugin crash tracking — fixed-size buffer of FNV-1a hashes of plugin IDs
 private nonisolated(unsafe) var gPluginHashSlots: UnsafeMutablePointer<UInt64>?
+private nonisolated(unsafe) var gPluginRefCountSlots: UnsafeMutablePointer<Int32>?
 private nonisolated(unsafe) var gPluginHashCount: Int32 = 0
 private nonisolated(unsafe) var gPluginHashLock = os_unfair_lock()
 private let gMaxPluginSlots = 128
@@ -22,6 +23,24 @@ private let gMaxPluginSlots = 128
 private nonisolated(unsafe) var gCrashPluginFilePath: UnsafePointer<CChar>?
 
 // MARK: - Crash Signal Handler
+
+/// Appends one crash generation without erasing a marker whose quarantine has not yet
+/// reached durable settings. POSIX open/write/close are async-signal-safe; the normal
+/// startup reader deduplicates repeated hashes across generations.
+@discardableResult
+private nonisolated func appendCrashPluginHashes(
+    path: UnsafePointer<CChar>,
+    hashSlots: UnsafePointer<UInt64>,
+    hashCount: Int
+) -> Bool {
+    guard hashCount > 0 else { return true }
+    let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return false }
+    let byteCount = hashCount * MemoryLayout<UInt64>.size
+    let written = write(fd, hashSlots, byteCount)
+    let closeResult = close(fd)
+    return written == byteCount && closeResult == 0
+}
 
 /// C-compatible crash signal handler. Destroys all tracked aggregate devices
 /// via IPC to coreaudiod, then re-raises the signal for default crash behavior.
@@ -47,12 +66,11 @@ private nonisolated func crashSignalHandler(_ sig: Int32) {
     if let path = gCrashPluginFilePath, let hashSlots = gPluginHashSlots {
         let hashCount = Int(gPluginHashCount)
         if hashCount > 0 {
-            let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-            if fd >= 0 {
-                let byteCount = hashCount * MemoryLayout<UInt64>.size
-                _ = write(fd, hashSlots, byteCount)
-                close(fd)
-            }
+            _ = appendCrashPluginHashes(
+                path: path,
+                hashSlots: UnsafePointer(hashSlots),
+                hashCount: hashCount
+            )
         }
     }
 
@@ -80,6 +98,9 @@ nonisolated enum CrashGuard {
         let pluginBuffer = UnsafeMutablePointer<UInt64>.allocate(capacity: gMaxPluginSlots)
         pluginBuffer.initialize(repeating: 0, count: gMaxPluginSlots)
         gPluginHashSlots = pluginBuffer
+        let pluginRefCounts = UnsafeMutablePointer<Int32>.allocate(capacity: gMaxPluginSlots)
+        pluginRefCounts.initialize(repeating: 0, count: gMaxPluginSlots)
+        gPluginRefCountSlots = pluginRefCounts
 
         // Resolve crash file path once (async-signal-safe read later)
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -131,17 +152,20 @@ nonisolated enum CrashGuard {
         let hash = fnv1aHash(pluginID)
         os_unfair_lock_lock(&gPluginHashLock)
         defer { os_unfair_lock_unlock(&gPluginHashLock) }
-        guard let slots = gPluginHashSlots else { return }
+        guard let slots = gPluginHashSlots, let refCounts = gPluginRefCountSlots else { return }
         let n = Int(gPluginHashCount)
-        // Deduplicate
         for i in 0..<n {
-            if slots[i] == hash { return }
+            if slots[i] == hash {
+                refCounts[i] += 1
+                return
+            }
         }
         guard n < gMaxPluginSlots else {
             logger.error("Plugin slot limit (\(gMaxPluginSlots)) reached")
             return
         }
         slots[n] = hash
+        refCounts[n] = 1
         gPluginHashCount += 1
     }
 
@@ -149,26 +173,45 @@ nonisolated enum CrashGuard {
         let hash = fnv1aHash(pluginID)
         os_unfair_lock_lock(&gPluginHashLock)
         defer { os_unfair_lock_unlock(&gPluginHashLock) }
-        guard let slots = gPluginHashSlots else { return }
+        guard let slots = gPluginHashSlots, let refCounts = gPluginRefCountSlots else { return }
         let n = Int(gPluginHashCount)
         for i in 0..<n {
             if slots[i] == hash {
+                if refCounts[i] > 1 {
+                    refCounts[i] -= 1
+                    return
+                }
                 let lastIdx = n - 1
                 slots[i] = slots[lastIdx]
+                refCounts[i] = refCounts[lastIdx]
                 slots[lastIdx] = 0
+                refCounts[lastIdx] = 0
                 gPluginHashCount -= 1
                 return
             }
         }
     }
 
-    /// Reads crash plugin hashes written by the signal handler on previous crash.
-    /// Returns matching plugin IDs from the provided known set, then deletes the file.
-    static func readAndClearCrashPlugins(knownPluginIDs: [String]) -> Set<String> {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let filePath = appSupport.appendingPathComponent("FineTune/.au-crash-plugins")
+    private static func crashPluginFileURL(directory: URL?) -> URL {
+        if let directory {
+            return directory.appendingPathComponent(".au-crash-plugins")
+        }
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return appSupport.appendingPathComponent("FineTune/.au-crash-plugins")
+    }
+
+    /// Reads crash plugin hashes written by the signal handler on a previous crash.
+    /// The marker deliberately remains on disk until the caller has durably persisted
+    /// quarantine state and acknowledges it with `clearCrashPlugins()`.
+    static func readCrashPlugins(
+        knownPluginIDs: [String],
+        directory: URL? = nil
+    ) -> Set<String> {
+        let filePath = crashPluginFileURL(directory: directory)
         guard let data = try? Data(contentsOf: filePath) else { return [] }
-        try? FileManager.default.removeItem(at: filePath)
 
         let hashCount = data.count / MemoryLayout<UInt64>.size
         guard hashCount > 0 else { return [] }
@@ -189,6 +232,31 @@ nonisolated enum CrashGuard {
         }
         return matched
     }
+
+    /// Acknowledges a crash marker only after its quarantine has been saved durably.
+    static func clearCrashPlugins(directory: URL? = nil) {
+        try? FileManager.default.removeItem(at: crashPluginFileURL(directory: directory))
+    }
+
+    #if DEBUG
+    /// Exercises the exact signal-handler writer without raising a fatal signal.
+    static func appendCrashPluginHashesForTesting(
+        _ hashes: [UInt64],
+        directory: URL
+    ) -> Bool {
+        let path = crashPluginFileURL(directory: directory).path
+        return path.withCString { cPath in
+            hashes.withUnsafeBufferPointer { buffer in
+                guard let baseAddress = buffer.baseAddress else { return true }
+                return appendCrashPluginHashes(
+                    path: cPath,
+                    hashSlots: baseAddress,
+                    hashCount: buffer.count
+                )
+            }
+        }
+    }
+    #endif
 
     /// Removes an aggregate device from crash-safe tracking.
     /// Call immediately before `AudioHardwareDestroyAggregateDevice`.

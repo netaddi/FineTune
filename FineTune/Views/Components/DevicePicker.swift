@@ -354,6 +354,15 @@ struct DevicePicker: View {
             isSelected: isSelected,
             isDisabled: isDisabled,
             isMultiMode: currentMode == .multi,
+            isPrimarySelection: {
+                guard currentMode == .multi,
+                      case .device(let device) = item else { return false }
+                // selectedDeviceUID is the first UID actually committed by AudioEngine.
+                // Priority edits update this only after the tap reconfiguration succeeds,
+                // so a failed switch or a hidden clock device cannot produce a false badge.
+                return currentSelectedUIDs.contains(device.uid)
+                    && device.uid == selectedDeviceUID
+            }(),
             isDefaultDevice: {
                 if case .device(let device) = item {
                     return device.uid == defaultDeviceUID
@@ -419,6 +428,7 @@ private struct DevicePickerRow: View {
     let isSelected: Bool
     let isDisabled: Bool
     let isMultiMode: Bool
+    let isPrimarySelection: Bool
     let isDefaultDevice: Bool
     let onTap: () -> Void
 
@@ -437,6 +447,12 @@ private struct DevicePickerRow: View {
                 itemText
 
                 Spacer()
+
+                if isPrimarySelection {
+                    Text("Primary")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(DesignTokens.Colors.textSecondary)
+                }
 
                 // Default device star
                 if isDefaultDevice {

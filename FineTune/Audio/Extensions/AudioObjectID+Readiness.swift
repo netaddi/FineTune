@@ -41,4 +41,21 @@ extension AudioObjectID {
 
         return false
     }
+
+    /// Aggregate devices can report alive before their nominal-rate property is readable.
+    /// Retry for a bounded interval and return only a finite, positive HAL value; callers
+    /// must abandon a device transaction when this returns nil rather than guessing a rate.
+    func waitForNominalSampleRate(
+        timeout: TimeInterval = 0.5,
+        pollInterval: TimeInterval = 0.01
+    ) -> Float64? {
+        let deadline = CFAbsoluteTimeGetCurrent() + timeout
+        repeat {
+            if let rate = try? readNominalSampleRate(), rate.isFinite, rate > 0 {
+                return rate
+            }
+            CFRunLoopRunInMode(.defaultMode, pollInterval, false)
+        } while CFAbsoluteTimeGetCurrent() < deadline
+        return nil
+    }
 }

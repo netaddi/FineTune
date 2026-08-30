@@ -10,7 +10,7 @@ final class UpdateManager: NSObject, ObservableObject {
 
     @Published var canCheckForUpdates = false
 
-    override init() {
+    init(startUpdater: Bool = true) {
         // Create the updater controller without auto-starting (prevents popup on launch)
         updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
@@ -18,6 +18,8 @@ final class UpdateManager: NSObject, ObservableObject {
             userDriverDelegate: nil
         )
         super.init()
+
+        guard startUpdater else { return }
 
         // Start updater to enable manual checks, but don't trigger auto-check UI
         try? updaterController.updater.start()

@@ -136,6 +136,63 @@ private func loadRepositorySource(_ relativePath: String) throws -> String {
     return try String(contentsOf: url, encoding: .utf8)
 }
 
+@Suite("ProcessTapController — Callback Generation Gate")
+struct CallbackGenerationGateTests {
+    @Test("Stable primary and secondary generations may commit")
+    func stableGenerationsCommit() {
+        #expect(ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 4,
+            currentHandoff: 4,
+            isSecondary: false,
+            secondaryAtStart: 8,
+            currentSecondary: 10
+        ))
+        #expect(ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 4,
+            currentHandoff: 4,
+            isSecondary: true,
+            secondaryAtStart: 8,
+            currentSecondary: 8
+        ))
+    }
+
+    @Test("Odd or changed handoff generations discard an obsolete buffer")
+    func handoffInvalidatesCommit() {
+        #expect(!ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 5,
+            currentHandoff: 5,
+            isSecondary: false,
+            secondaryAtStart: 8,
+            currentSecondary: 8
+        ))
+        #expect(!ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 4,
+            currentHandoff: 6,
+            isSecondary: true,
+            secondaryAtStart: 8,
+            currentSecondary: 8
+        ))
+    }
+
+    @Test("A retired secondary snapshot cannot commit into its replacement")
+    func secondaryReplacementInvalidatesCommit() {
+        #expect(!ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 4,
+            currentHandoff: 4,
+            isSecondary: true,
+            secondaryAtStart: 8,
+            currentSecondary: 10
+        ))
+        #expect(!ProcessTapController.callbackGenerationAllowsCommit(
+            handoffAtStart: 4,
+            currentHandoff: 4,
+            isSecondary: true,
+            secondaryAtStart: 9,
+            currentSecondary: 9
+        ))
+    }
+}
+
 // MARK: - Buffer Mapping Tests
 
 @Suite("ProcessTapController — Buffer Mapping")
@@ -844,6 +901,79 @@ struct ProcessingChainTests {
             #expect(outData[i] == 0.0,
                     "Trailing sample \(i) should be zeroed, got \(outData[i])")
         }
+    }
+
+    @Test(
+        "Stateful AU renders once before two-output fan-out",
+        arguments: [true, false]
+    )
+    func statefulAURendersOnceBeforeFanOut(appScoped: Bool) throws {
+        let frames = 256
+        let input = TestABL(buffers: [
+            (channels: 2, frames: frames),
+            (channels: 2, frames: frames)
+        ])
+        let output = TestABL(buffers: [
+            (channels: 2, frames: frames),
+            (channels: 2, frames: frames)
+        ])
+        for bufferIndex in 0..<2 {
+            let samples = input.data(at: bufferIndex)
+            for frame in 0..<frames {
+                let value = sinf(2 * .pi * 10_000 * Float(frame) / 48_000) * 0.25
+                samples[frame * 2] = value
+                samples[frame * 2 + 1] = value
+            }
+        }
+
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let chain = AUEffectChain(
+            entries: [AUEffectChainEntry(plugin: descriptor)],
+            sampleRate: 48_000,
+            maxFrames: UInt32(frames)
+        )
+        let host = try #require(chain.hosts.first)
+        let au = try #require(host.audioUnit)
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 200, 0) == noErr)
+
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: frames * 2)
+        scratch.initialize(repeating: 0, count: frames * 2)
+        defer { scratch.deallocate() }
+        var volume: Float = 1
+        ProcessTapController.processMappedBuffers(
+            inputBuffers: input.bufferList,
+            outputBuffers: output.bufferList,
+            targetVol: 1,
+            crossfadeMultiplier: 1,
+            outputGateMultiplier: 1,
+            rampCoefficient: 1,
+            preferredStereoLeft: 0,
+            preferredStereoRight: 1,
+            currentVol: &volume,
+            eqProc: nil,
+            autoEQProc: nil,
+            appAUChain: appScoped ? chain : nil,
+            deviceAUChain: appScoped ? nil : chain,
+            loudnessEqualizerProc: nil,
+            loudnessCompensatorProc: nil,
+            appProcessingScratch: scratch,
+            appProcessingFrameCapacity: frames
+        )
+
+        let first = output.data(at: 0)
+        let second = output.data(at: 1)
+        var maxDifference: Float = 0
+        for index in 0..<(frames * 2) {
+            maxDifference = max(maxDifference, abs(first[index] - second[index]))
+        }
+        #expect(maxDifference < 1e-6)
     }
 }
 

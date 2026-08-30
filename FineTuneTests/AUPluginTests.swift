@@ -1,7 +1,14 @@
 // FineTuneTests/AUPluginTests.swift
 import AudioToolbox
+import AppKit
+import Foundation
 import Testing
 @testable import FineTune
+
+@MainActor
+private final class LiveChangeCounter {
+    var value = 0
+}
 
 // MARK: - AUPluginDescriptor Tests
 
@@ -273,6 +280,23 @@ struct AUEffectHostTests {
         #expect(host.loadPreset(saved) == true)
     }
 
+    @Test("Sample-rate reconfiguration preserves the Audio Unit instance")
+    func reconfigurePreservesInstance() {
+        let host = AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: UUID(),
+            sampleRate: 44100
+        )
+        guard host.instantiate(), let originalAudioUnit = host.audioUnit else {
+            Issue.record("Failed to instantiate AUDelay")
+            return
+        }
+
+        #expect(host.reconfigure(sampleRate: 48000))
+        #expect(host.audioUnit == originalAudioUnit)
+        #expect(host.configuredSampleRate == 48000)
+    }
+
     @Test("renderInterleaved actually modifies audio with AULowpass")
     func renderInterleavedModifiesAudio() {
         let desc = AUPluginDescriptor(
@@ -439,6 +463,15 @@ struct AUEffectChainTests {
         #expect(chain.hosts.count == 1)
     }
 
+    @Test("Duplicate entry IDs do not instantiate duplicate Audio Units")
+    func duplicateEntryIDsAreDeduplicated() {
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        let chain = AUEffectChain(entries: [entry, entry], sampleRate: 44100)
+
+        #expect(chain.entries.count == 1)
+        #expect(chain.hosts.count == 1)
+    }
+
     @Test("Bypass flag starts false")
     func bypassDefault() {
         let chain = AUEffectChain(entries: [], sampleRate: 44100)
@@ -468,6 +501,413 @@ struct AUEffectChainTests {
         let chain = AUEffectChain(entries: [entry], sampleRate: 44100)
         #expect(chain.host(for: entry.id) != nil)
         #expect(chain.host(for: UUID()) == nil)
+    }
+
+    @Test("Selecting Default restores baseline without replacing the Audio Unit")
+    func defaultPresetRestoresReusedHost() throws {
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let entry = AUEffectChainEntry(plugin: descriptor)
+        let original = AUEffectChain(entries: [entry], sampleRate: 48_000)
+        let host = try #require(original.host(for: entry.id))
+        let au = try #require(host.audioUnit)
+
+        var baseline: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(au, 0, kAudioUnitScope_Global, 0, &baseline) == noErr)
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 200, 0) == noErr)
+
+        var presetEntry = entry
+        presetEntry.presetData = try #require(host.savePreset())
+        let withPreset = AUEffectChain(
+            entries: [presetEntry],
+            sampleRate: 48_000,
+            reusing: original
+        )
+        var defaultEntry = presetEntry
+        defaultEntry.presetData = nil
+        let restored = AUEffectChain(
+            entries: [defaultEntry],
+            sampleRate: 48_000,
+            reusing: withPreset
+        )
+
+        var restoredValue: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(au, 0, kAudioUnitScope_Global, 0, &restoredValue) == noErr)
+        #expect(restored.host(for: entry.id) === host)
+        #expect(restored.host(for: entry.id)?.audioUnit == au)
+        #expect(abs(restoredValue - baseline) < 0.001)
+    }
+
+    @Test("Live-state snapshots preserve Default metadata until the editor changes a parameter")
+    func liveSnapshotPreservesDefaultMetadataUntilEdited() throws {
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let entry = AUEffectChainEntry(plugin: descriptor)
+        let chain = AUEffectChain(entries: [entry], sampleRate: 48_000)
+        let host = try #require(chain.host(for: entry.id))
+        let au = try #require(host.audioUnit)
+
+        let unchanged = try #require(chain.entriesWithLiveState().first)
+        #expect(unchanged.presetData == nil)
+        #expect(unchanged.selectedFactoryPresetIndex == nil)
+
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 200, 0) == noErr)
+        let edited = try #require(chain.entriesWithLiveState().first)
+        #expect(edited.presetData != nil)
+        #expect(edited.selectedFactoryPresetIndex == nil)
+    }
+
+    @Test("Window state sync preserves Default and factory metadata until a real edit")
+    func liveStateMergePreservesPresetMetadata() {
+        let data = Data("live-state".utf8)
+        var factoryEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        factoryEntry.selectedFactoryPresetIndex = 7
+
+        let unchangedFactory = factoryEntry.mergingLivePresetData(
+            data,
+            matchesLastAppliedPreset: true
+        )
+        #expect(unchangedFactory == factoryEntry)
+        #expect(unchangedFactory.selectedFactoryPresetIndex == 7)
+        #expect(unchangedFactory.presetData == nil)
+
+        let editedFactory = factoryEntry.mergingLivePresetData(
+            data,
+            matchesLastAppliedPreset: false
+        )
+        #expect(editedFactory.selectedFactoryPresetIndex == nil)
+        #expect(editedFactory.presetData == data)
+
+        let defaultEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        #expect(defaultEntry.mergingLivePresetData(
+            data,
+            matchesLastAppliedPreset: true
+        ) == defaultEntry)
+    }
+
+    @Test("A crash-quarantined cold-start entry does not instantiate third-party code")
+    func quarantinedColdStartDoesNotInstantiate() {
+        var entry = AUEffectChainEntry(
+            plugin: AUPluginDescriptor(
+                componentType: kAudioUnitType_Effect,
+                componentSubType: 0xFFFF_FFFE,
+                componentManufacturer: 0xFFFF_FFFD,
+                name: "Quarantined",
+                manufacturer: "Test",
+                version: 1
+            )
+        )
+        entry.isEnabled = false
+        entry.isCrashQuarantined = true
+        let chain = AUEffectChain(entries: [entry], sampleRate: 48_000)
+        #expect(chain.hosts.isEmpty)
+        #expect(chain.failedEntryIDs.isEmpty)
+    }
+
+    @Test("An ordinary disabled non-Console entry stays cold")
+    func userDisabledGenericColdStartDoesNotInstantiate() {
+        var entry = AUEffectChainEntry(plugin: appleAUDelay())
+        entry.isEnabled = false
+
+        let chain = AUEffectChain(entries: [entry], sampleRate: 48_000)
+
+        #expect(chain.failedEntryIDs.isEmpty)
+        #expect(chain.hosts.isEmpty)
+        #expect(!entry.shouldInstantiateOnColdStart(retainingDisabledConsole: false))
+    }
+
+    @Test("A user-disabled Console 1 remains cold-start eligible for track reservation")
+    func userDisabledConsoleRemainsEligible() {
+        var entry = AUEffectChainEntry(
+            plugin: AUPluginDescriptor(
+                componentType: kAudioUnitType_Effect,
+                componentSubType: 0x5363_5069,
+                componentManufacturer: 0x5366_5462,
+                name: "Console 1",
+                manufacturer: "Softube",
+                version: 1
+            )
+        )
+        entry.isEnabled = false
+
+        #expect(entry.pluginDescriptor.isSoftubeConsole1)
+        #expect(!entry.shouldInstantiateOnColdStart(retainingDisabledConsole: false))
+        #expect(entry.shouldInstantiateOnColdStart(retainingDisabledConsole: true))
+    }
+
+    @Test("Device-chain edits reuse hosts so an open editor cannot detach")
+    @MainActor
+    func deviceChainEditsReuseHost() throws {
+        let app = AudioApp(
+            id: 42,
+            processObjectIDs: [],
+            name: "Test",
+            icon: NSImage(),
+            bundleID: "com.test.device-au"
+        )
+        let controller = ProcessTapController(app: app, targetDeviceUID: "test-device")
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        controller.updateDeviceAUEffectChain([entry])
+        let host = try #require(controller.getDeviceAUHost(for: entry.id))
+        let audioUnit = try #require(host.audioUnit)
+
+        var disabled = entry
+        disabled.isEnabled = false
+        controller.updateDeviceAUEffectChain([disabled])
+
+        #expect(controller.getDeviceAUHost(for: entry.id) === host)
+        #expect(controller.getDeviceAUHost(for: entry.id)?.audioUnit == audioUnit)
+        #expect(host.isEnabled == false)
+    }
+
+    @Test("Device editor sync does not reload ClassInfo into its source host")
+    @MainActor
+    func deviceEditorSyncPreservesSourceHostLiveState() throws {
+        let app = AudioApp(
+            id: 43,
+            processObjectIDs: [],
+            name: "Test",
+            icon: NSImage(),
+            bundleID: "com.test.device-au-live"
+        )
+        let controller = ProcessTapController(app: app, targetDeviceUID: "test-device")
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        controller.updateDeviceAUEffectChain([entry])
+        let host = try #require(controller.getDeviceAUHost(for: entry.id))
+        let audioUnit = try #require(host.audioUnit)
+
+        #expect(AudioUnitSetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            0.75,
+            0
+        ) == noErr)
+        var propagatedEntry = entry
+        propagatedEntry.presetData = try #require(host.savePreset())
+
+        #expect(AudioUnitSetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            0.25,
+            0
+        ) == noErr)
+        controller.updateDeviceAUEffectChain(
+            [propagatedEntry],
+            explicitPresetEntryID: nil,
+            preservingLiveStateFor: host
+        )
+
+        var liveValue: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            &liveValue
+        ) == noErr)
+        #expect(abs(liveValue - 0.25) < 0.001)
+        #expect(controller.getDeviceAUHost(for: entry.id) === host)
+    }
+
+    @Test("A shared-device editor survives a non-source transition and saves on its source transition")
+    @MainActor
+    func deviceEditorClosesOnlyForItsSourceHost() throws {
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        let sourceController = ProcessTapController(
+            app: AudioApp(
+                id: 44,
+                processObjectIDs: [],
+                name: "Source",
+                icon: NSImage(),
+                bundleID: "com.test.device-source"
+            ),
+            targetDeviceUID: "shared-device"
+        )
+        let otherController = ProcessTapController(
+            app: AudioApp(
+                id: 45,
+                processObjectIDs: [],
+                name: "Other",
+                icon: NSImage(),
+                bundleID: "com.test.device-other"
+            ),
+            targetDeviceUID: "shared-device"
+        )
+        sourceController.updateDeviceAUEffectChain([entry])
+        otherController.updateDeviceAUEffectChain([entry])
+        let sourceHost = try #require(sourceController.getDeviceAUHost(for: entry.id))
+        let sourceAudioUnit = try #require(sourceHost.audioUnit)
+        let manager = AUPluginWindowManager.shared
+        manager.closeWindow(for: entry.id)
+        var saveCount = 0
+        manager.showWindow(
+            for: entry.id,
+            audioUnit: sourceAudioUnit,
+            pluginName: "AUDelay transition test",
+            forceGeneric: true,
+            sourceHost: sourceHost
+        ) {
+            saveCount += 1
+        }
+        defer { manager.closeWindow(for: entry.id) }
+
+        #expect(manager.hasOpenWindowForTesting(entryID: entry.id))
+        AudioEngine.closeDeviceAUEditorsBackedByTap(otherController, windowManager: manager)
+        #expect(manager.hasOpenWindowForTesting(entryID: entry.id))
+        #expect(saveCount == 0)
+
+        AudioEngine.closeDeviceAUEditorsBackedByTap(sourceController, windowManager: manager)
+        #expect(!manager.hasOpenWindowForTesting(entryID: entry.id))
+        #expect(saveCount == 1)
+    }
+
+    @Test("Device editor observer registers concrete Audio Unit parameters")
+    @MainActor
+    func deviceEditorObserverEnumeratesConcreteParameters() throws {
+        let host = AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: UUID(),
+            sampleRate: 48_000
+        )
+        #expect(host.instantiate())
+        let audioUnit = try #require(host.audioUnit)
+
+        #expect(
+            AUPluginWindowManager.shared.observableParameterCountForTesting(audioUnit) > 0
+        )
+    }
+
+    @Test("Device editor rejects malformed or unbounded AU parameter lists")
+    func deviceEditorObserverBoundsParameterListSize() {
+        let parameterSize = UInt32(MemoryLayout<AudioUnitParameterID>.size)
+        #expect(
+            AUPluginWindowManager.validatedParameterCountForTesting(
+                byteCount: parameterSize * 4
+            ) == 4
+        )
+        #expect(
+            AUPluginWindowManager.validatedParameterCountForTesting(
+                byteCount: parameterSize + 1
+            ) == nil
+        )
+        #expect(
+            AUPluginWindowManager.validatedParameterCountForTesting(
+                byteCount: UInt32.max
+            ) == nil
+        )
+
+        var remainingBudget = 16_384
+        #expect(
+            AUPluginWindowManager.consumeParameterBudgetForTesting(
+                10_000,
+                remaining: &remainingBudget
+            )
+        )
+        #expect(remainingBudget == 6_384)
+        #expect(
+            !AUPluginWindowManager.consumeParameterBudgetForTesting(
+                6_385,
+                remaining: &remainingBudget
+            )
+        )
+        #expect(remainingBudget == 6_384)
+    }
+
+    @Test("Device editor observer delivers a debounced concrete-parameter change")
+    @MainActor
+    func deviceEditorObserverDeliversChange() async throws {
+        let host = AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: UUID(),
+            sampleRate: 48_000
+        )
+        #expect(host.instantiate())
+        let audioUnit = try #require(host.audioUnit)
+        let entryID = UUID()
+        let counter = LiveChangeCounter()
+        let manager = AUPluginWindowManager.shared
+        #expect(manager.installLiveChangeListenerForTesting(
+            entryID: entryID,
+            audioUnit: audioUnit
+        ) {
+            counter.value += 1
+        })
+        defer {
+            manager.removeLiveChangeListenerForTesting(entryID: entryID)
+        }
+
+        #expect(manager.notifyFirstObservableParameterForTesting(audioUnit))
+        try await Task.sleep(for: .milliseconds(700))
+
+        #expect(counter.value == 1)
+    }
+
+    @Test("Device editor commit marker detects an undo back to the original state")
+    func deviceEditorCommitThenUndoIsANewChange() throws {
+        let host = AUEffectHost(
+            descriptor: appleAUDelay(),
+            entryID: UUID(),
+            sampleRate: 48_000
+        )
+        #expect(host.instantiate())
+        let audioUnit = try #require(host.audioUnit)
+        var baselineValue: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            &baselineValue
+        ) == noErr)
+
+        let editedValue = baselineValue > 0.25
+            ? baselineValue - 0.25
+            : baselineValue + 0.25
+        #expect(AudioUnitSetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            editedValue,
+            0
+        ) == noErr)
+        let editedData = try #require(host.savePreset())
+        host.markLivePresetDataAsApplied(editedData)
+
+        #expect(AudioUnitSetParameter(
+            audioUnit,
+            0,
+            kAudioUnitScope_Global,
+            0,
+            baselineValue,
+            0
+        ) == noErr)
+        let revertedData = try #require(host.savePreset())
+
+        #expect(!host.liveStateMatchesLastAppliedPreset(revertedData))
+        var committedEntry = AUEffectChainEntry(plugin: appleAUDelay())
+        committedEntry.presetData = editedData
+        let revertedEntry = committedEntry.mergingLivePresetData(
+            revertedData,
+            matchesLastAppliedPreset: host.liveStateMatchesLastAppliedPreset(revertedData)
+        )
+        #expect(revertedEntry.presetData == revertedData)
     }
 
     @Test("processInterleaved routes audio through chain")
@@ -530,6 +970,119 @@ struct AUEffectChainTests {
         #expect(buffer == original)
     }
 
+    @Test("Rebuilding a chain reuses unchanged hosts and Audio Unit instances")
+    func rebuildingReusesHost() {
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        let original = AUEffectChain(entries: [entry], sampleRate: 44100)
+        guard let originalHost = original.host(for: entry.id),
+              let originalAudioUnit = originalHost.audioUnit else {
+            Issue.record("Failed to instantiate AUDelay")
+            return
+        }
+
+        var disabledEntry = entry
+        disabledEntry.isEnabled = false
+        let rebuilt = AUEffectChain(
+            entries: [disabledEntry],
+            sampleRate: 48000,
+            reusing: original
+        )
+
+        #expect(rebuilt.host(for: entry.id) === originalHost)
+        #expect(rebuilt.host(for: entry.id)?.audioUnit == originalAudioUnit)
+        #expect(rebuilt.host(for: entry.id)?.isEnabled == false)
+        #expect(rebuilt.sampleRate == 48000)
+    }
+
+    private func appleAUDelay() -> AUPluginDescriptor {
+        AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+    }
+}
+
+// MARK: - PersistentMixerStrip Tests
+
+@Suite("PersistentMixerStrip", .serialized)
+@MainActor
+struct PersistentMixerStripTests {
+
+    @Test("Entry updates retain unchanged Audio Unit instances")
+    func updateEntriesRetainsInstance() {
+        let entry = AUEffectChainEntry(plugin: appleAUDelay())
+        let strip = PersistentMixerStrip(
+            persistenceIdentifier: "com.test.browser",
+            displayName: "Browser",
+            slot: 1,
+            entries: [entry],
+            sampleRate: 44100,
+            isBypassed: false
+        )
+        guard let originalHost = strip.host(for: entry.id),
+              let originalAudioUnit = originalHost.audioUnit else {
+            Issue.record("Failed to instantiate AUDelay")
+            return
+        }
+
+        var disabledEntry = entry
+        disabledEntry.isEnabled = false
+        strip.updateEntries([disabledEntry], sampleRate: 48000)
+
+        #expect(strip.host(for: entry.id) === originalHost)
+        #expect(strip.host(for: entry.id)?.audioUnit == originalAudioUnit)
+        #expect(strip.host(for: entry.id)?.isEnabled == false)
+    }
+
+    // PACE Fusion installs Mach exception handlers while Console 1 is loading.
+    // SwiftPM's testing helper guards those ports and is terminated with
+    // EXC_GUARD before AudioComponentInstanceNew can return. Keep this
+    // destructive in-process probe opt-in; the exported FineTune.app launch
+    // smoke is the supported end-to-end host validation.
+    @Test(
+        "Console 1 instantiates and survives a strip rebuild in a compatible host",
+        .enabled(
+            if: ProcessInfo.processInfo.environment[
+                "FINETUNE_ALLOW_IN_PROCESS_CONSOLE1_TEST"
+            ] == "1",
+            "PACE Fusion is incompatible with SwiftPM's guarded test helper; validate the exported FineTune.app instead."
+        )
+    )
+    func consoleOneIntegration() {
+        let scanner = AUPluginScanner()
+        guard let consoleOne = scanner.plugins.first(where: \.isSoftubeConsole1) else {
+            Issue.record("Console 1 was not discovered")
+            return
+        }
+
+        let entry = AUEffectChainEntry(plugin: consoleOne)
+        let strip = PersistentMixerStrip(
+            persistenceIdentifier: "com.google.Chrome",
+            displayName: "Google Chrome",
+            slot: 1,
+            entries: [entry],
+            sampleRate: 48000,
+            isBypassed: false
+        )
+        guard let originalHost = strip.host(for: entry.id),
+              let originalAudioUnit = originalHost.audioUnit else {
+            Issue.record("Console 1 was discovered but could not be instantiated")
+            return
+        }
+
+        var disabledEntry = entry
+        disabledEntry.isEnabled = false
+        strip.updateEntries([disabledEntry], sampleRate: 48000)
+
+        #expect(strip.failedEntryIDs.isEmpty)
+        #expect(strip.host(for: entry.id) === originalHost)
+        #expect(strip.host(for: entry.id)?.audioUnit == originalAudioUnit)
+    }
+
     private func appleAUDelay() -> AUPluginDescriptor {
         AUPluginDescriptor(
             componentType: kAudioUnitType_Effect,
@@ -561,10 +1114,61 @@ struct CrashGuardPluginTrackingTests {
         #expect(h1 != h2)
     }
 
-    @Test("readAndClearCrashPlugins returns empty when no crash file")
+    @Test("readCrashPlugins returns empty when no crash file")
     func noCrashFile() {
-        let result = CrashGuard.readAndClearCrashPlugins(knownPluginIDs: ["foo", "bar"])
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneCrashGuardTests-\(UUID().uuidString)")
+        let result = CrashGuard.readCrashPlugins(
+            knownPluginIDs: ["foo", "bar"],
+            directory: directory
+        )
         #expect(result.isEmpty)
+    }
+
+    @Test("Crash marker remains until durable quarantine is acknowledged")
+    func crashMarkerUsesTwoPhaseAcknowledgement() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneCrashGuardTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let marker = directory.appendingPathComponent(".au-crash-plugins")
+        let pluginID = "test-plugin"
+        var hashes = [CrashGuard.fnv1aHash(pluginID)]
+        let data = hashes.withUnsafeBytes { Data($0) }
+        try data.write(to: marker)
+
+        let result = CrashGuard.readCrashPlugins(
+            knownPluginIDs: [pluginID, "other-plugin"],
+            directory: directory
+        )
+
+        #expect(result == [pluginID])
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+        CrashGuard.clearCrashPlugins(directory: directory)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test("A later crash appends active plugins without erasing an unacknowledged marker")
+    func crashMarkerAppendsAcrossFailedQuarantineGenerations() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneCrashGuardTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pluginA = "plugin-from-unacknowledged-crash"
+        let pluginB = "plugin-from-later-crash"
+
+        #expect(CrashGuard.appendCrashPluginHashesForTesting(
+            [CrashGuard.fnv1aHash(pluginA)],
+            directory: directory
+        ))
+        #expect(CrashGuard.appendCrashPluginHashesForTesting(
+            [CrashGuard.fnv1aHash(pluginB), CrashGuard.fnv1aHash(pluginA)],
+            directory: directory
+        ))
+
+        #expect(CrashGuard.readCrashPlugins(
+            knownPluginIDs: [pluginA, pluginB],
+            directory: directory
+        ) == [pluginA, pluginB])
     }
 }
 
@@ -576,7 +1180,7 @@ struct SettingsManagerAUTests {
 
     @Test("Get/set app AU effect chain round-trip")
     func appChainRoundTrip() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         let entry = AUEffectChainEntry(plugin: makePlugin())
         settings.setAUEffectChain([entry], for: "com.test.app")
         let loaded = settings.getAUEffectChain(for: "com.test.app")
@@ -586,7 +1190,7 @@ struct SettingsManagerAUTests {
 
     @Test("Empty chain removes key")
     func emptyChainRemovesKey() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         let entry = AUEffectChainEntry(plugin: makePlugin())
         settings.setAUEffectChain([entry], for: "com.test.app")
         settings.setAUEffectChain([], for: "com.test.app")
@@ -596,7 +1200,7 @@ struct SettingsManagerAUTests {
 
     @Test("Get/set device AU effect chain round-trip")
     func deviceChainRoundTrip() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         let entry = AUEffectChainEntry(plugin: makePlugin())
         settings.setDeviceAUEffectChain([entry], for: "device-uid-123")
         let loaded = settings.getDeviceAUEffectChain(for: "device-uid-123")
@@ -604,9 +1208,27 @@ struct SettingsManagerAUTests {
         #expect(loaded[0].id == entry.id)
     }
 
+    @Test("Device AU persistence rejects Console 1 at runtime")
+    func deviceChainRejectsConsoleOne() {
+        let settings = makeSettings()
+        let generic = AUEffectChainEntry(plugin: makePlugin())
+        let console = AUEffectChainEntry(plugin: AUPluginDescriptor(
+            componentType: 0x6175_6678,
+            componentSubType: 0x5363_5069,
+            componentManufacturer: 0x5366_5462,
+            name: "Console 1",
+            manufacturer: "Softube",
+            version: 1
+        ))
+
+        settings.setDeviceAUEffectChain([console, generic], for: "device-uid-123")
+
+        #expect(settings.getDeviceAUEffectChain(for: "device-uid-123").map(\.id) == [generic.id])
+    }
+
     @Test("Favorite toggle works")
     func favoriteToggle() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         let pluginID = "test-plugin-id"
         #expect(settings.isAUPluginFavorite(pluginID) == false)
         settings.toggleAUPluginFavorite(pluginID)
@@ -617,7 +1239,7 @@ struct SettingsManagerAUTests {
 
     @Test("Crash history tracking")
     func crashHistory() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         #expect(settings.wasAUPluginInvolvedInCrash("p1") == false)
         settings.markAUPluginsActiveAtCrash(["p1", "p2"])
         #expect(settings.wasAUPluginInvolvedInCrash("p1") == true)
@@ -629,7 +1251,7 @@ struct SettingsManagerAUTests {
 
     @Test("disableCrashedAUPlugins disables matching entries")
     func disableCrashed() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         let plugin1 = makePlugin(name: "Plugin1", subType: 1)
         let plugin2 = makePlugin(name: "Plugin2", subType: 2)
         var entry1 = AUEffectChainEntry(plugin: plugin1)
@@ -641,12 +1263,14 @@ struct SettingsManagerAUTests {
         let loaded = settings.getAUEffectChain(for: "com.test.app")
         #expect(loaded.count == 2)
         #expect(loaded[0].isEnabled == false)
+        #expect(loaded[0].isCrashQuarantined == true)
         #expect(loaded[1].isEnabled == true)
+        #expect(loaded[1].isCrashQuarantined != true)
     }
 
     @Test("Reset clears all AU settings")
     func resetClearsAll() {
-        let settings = SettingsManager()
+        let settings = makeSettings()
         settings.setAUEffectChain([AUEffectChainEntry(plugin: makePlugin())], for: "app1")
         settings.setDeviceAUEffectChain([AUEffectChainEntry(plugin: makePlugin())], for: "dev1")
         settings.toggleAUPluginFavorite("fav1")
@@ -660,6 +1284,37 @@ struct SettingsManagerAUTests {
         #expect(settings.wasAUPluginInvolvedInCrash("crash1") == false)
     }
 
+    @Test("Ignoring an app clears its AU chain, bypass, and mixer slot")
+    func ignoreClearsAppAUState() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FineTuneIgnoreAUTests-\(UUID().uuidString)")
+        let settings = SettingsManager(directory: directory)
+        let identifier = "com.test.app"
+        settings.pinApp(
+            identifier,
+            info: PinnedAppInfo(
+                persistenceIdentifier: identifier,
+                displayName: "Test App",
+                bundleID: identifier
+            )
+        )
+        settings.setAUEffectChain([AUEffectChainEntry(plugin: makePlugin())], for: identifier)
+        settings.setAppAUBypassed(true, for: identifier)
+
+        settings.ignoreApp(
+            identifier,
+            info: IgnoredAppInfo(
+                persistenceIdentifier: identifier,
+                displayName: "Test App",
+                bundleID: identifier
+            )
+        )
+
+        #expect(settings.getAUEffectChain(for: identifier).isEmpty)
+        #expect(settings.getAppAUBypassed(for: identifier) == false)
+        #expect(settings.getMixerStripSlot(for: identifier) == nil)
+    }
+
     private func makePlugin(name: String = "Test", subType: UInt32 = 0x74657374) -> AUPluginDescriptor {
         AUPluginDescriptor(
             componentType: kAudioUnitType_Effect,
@@ -668,6 +1323,13 @@ struct SettingsManagerAUTests {
             name: name,
             manufacturer: "Test",
             version: 1
+        )
+    }
+
+    private func makeSettings() -> SettingsManager {
+        SettingsManager(
+            directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("FineTuneAUTests-\(UUID().uuidString)")
         )
     }
 }

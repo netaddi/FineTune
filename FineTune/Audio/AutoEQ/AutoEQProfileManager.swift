@@ -26,20 +26,29 @@ final class AutoEQProfileManager {
     /// Normalized names for fuzzy search (parallel array with sortedEntries).
     private var normalizedNames: [String] = []
 
-    init(loader: AutoEQProfileLoader = AutoEQProfileLoader(), fetcher: AutoEQFetcher? = nil) {
+    init(
+        loader: AutoEQProfileLoader = AutoEQProfileLoader(),
+        fetcher: AutoEQFetcher? = nil,
+        loadPersistedProfiles: Bool = true,
+        loadCatalog: Bool = true
+    ) {
         self.loader = loader
         self.fetcher = fetcher ?? AutoEQFetcher()
 
         // Imported profiles are small — load synchronously
-        let imported = loader.loadImportedProfiles()
-        for profile in imported {
-            profiles[profile.id] = profile
+        if loadPersistedProfiles {
+            let imported = loader.loadImportedProfiles()
+            for profile in imported {
+                profiles[profile.id] = profile
+            }
         }
 
         // Load catalog from cache/GitHub
-        Task { @MainActor in
-            await self.fetcher.loadCatalog()
-            self.rebuildSearchIndex()
+        if loadCatalog {
+            Task { @MainActor in
+                await self.fetcher.loadCatalog()
+                self.rebuildSearchIndex()
+            }
         }
     }
 

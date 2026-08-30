@@ -842,12 +842,11 @@ struct MenuBarPopupView: View {
                             isIgnored: false,
                             isPinned: true,
                             onToggleVisibility: {
-                                let hiddenInfo = IgnoredAppInfo(
-                                    persistenceIdentifier: info.persistenceIdentifier,
+                                audioEngine.ignoreApp(
+                                    identifier: info.persistenceIdentifier,
                                     displayName: info.displayName,
                                     bundleID: info.bundleID
                                 )
-                                audioEngine.settingsManager.ignoreApp(info.persistenceIdentifier, info: hiddenInfo)
                             },
                             onTogglePin: {
                                 audioEngine.unpinApp(info.persistenceIdentifier)
@@ -968,6 +967,11 @@ struct MenuBarPopupView: View {
                     toggleEQ(for: displayableApp.id, scrollProxy: scrollProxy)
                 },
                 isFocused: hasKeyboardEngaged && selectedRow == .app(persistenceID: displayableApp.id),
+                mixerStripSlot: audioEngine.mixerStripSlot(for: app.persistenceIdentifier),
+                mixerStripSlotCount: audioEngine.mixerStripSlotCount,
+                onMixerStripSlotChange: { slot in
+                    audioEngine.setMixerStripSlot(slot, for: app.persistenceIdentifier)
+                },
                 auEffectChain: audioEngine.getAUEffectChain(for: app),
                 isAUChainBypassed: audioEngine.isAUChainBypassed(for: app),
                 auPluginScanner: auPluginScanner,
@@ -1017,7 +1021,7 @@ struct MenuBarPopupView: View {
             volume: audioEngine.getVolumeForInactive(identifier: identifier),
             devices: sortedDevices,
             deviceIconOverrides: audioEngine.settingsManager.deviceIconOverrides,
-            selectedDeviceUID: audioEngine.getDeviceRoutingForInactive(identifier: identifier),
+            selectedDeviceUID: audioEngine.getPrimaryDeviceUIDForInactive(identifier: identifier),
             selectedDeviceUIDs: audioEngine.getSelectedDeviceUIDsForInactive(identifier: identifier),
             isFollowingDefault: audioEngine.isFollowingDefaultForInactive(identifier: identifier),
             defaultDeviceUID: deviceVolumeMonitor.defaultDeviceUID,
@@ -1069,7 +1073,73 @@ struct MenuBarPopupView: View {
             onEQToggle: {
                 toggleEQ(for: displayableApp.id, scrollProxy: scrollProxy)
             },
-            isFocused: hasKeyboardEngaged && selectedRow == .app(persistenceID: displayableApp.id)
+            isFocused: hasKeyboardEngaged && selectedRow == .app(persistenceID: displayableApp.id),
+            mixerStripSlot: audioEngine.mixerStripSlot(for: identifier),
+            mixerStripSlotCount: audioEngine.mixerStripSlotCount,
+            onMixerStripSlotChange: { slot in
+                audioEngine.setMixerStripSlot(slot, for: identifier)
+            },
+            auEffectChain: audioEngine.getAUEffectChain(forIdentifier: identifier),
+            isAUChainBypassed: audioEngine.isAUChainBypassed(forIdentifier: identifier),
+            auPluginScanner: auPluginScanner,
+            getFavoriteAUPlugins: { audioEngine.favoriteAUPluginIDs },
+            getAUCrashHistory: { audioEngine.auCrashHistory },
+            onAddAUEffect: { plugin in
+                audioEngine.addAUEffect(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    plugin: plugin
+                )
+            },
+            onRemoveAUEffect: { entryID in
+                audioEngine.removeAUEffect(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    entryID: entryID
+                )
+            },
+            onToggleAUEffect: { entryID, enabled in
+                audioEngine.toggleAUEffect(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    entryID: entryID,
+                    enabled: enabled
+                )
+            },
+            onAUBypassToggle: {
+                let current = audioEngine.isAUChainBypassed(forIdentifier: identifier)
+                audioEngine.setAUChainBypassed(forIdentifier: identifier, bypassed: !current)
+            },
+            onToggleAUFavorite: { pluginID in
+                audioEngine.toggleAUPluginFavorite(pluginID)
+            },
+            onOpenAUUI: { entryID in
+                audioEngine.openAUPluginUI(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    entryID: entryID
+                )
+            },
+            onOpenAUGenericUI: { entryID in
+                audioEngine.openAUPluginUI(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    entryID: entryID,
+                    forceGeneric: true
+                )
+            },
+            auFailedEntryIDs: audioEngine.getAUFailedEntryIDs(forIdentifier: identifier),
+            getAUFactoryPresets: { entryID in
+                audioEngine.getAUFactoryPresets(forIdentifier: identifier, entryID: entryID)
+            },
+            onSelectAUFactoryPreset: { entryID, presetIndex in
+                audioEngine.selectAUFactoryPreset(
+                    forIdentifier: identifier,
+                    displayName: info.displayName,
+                    entryID: entryID,
+                    presetIndex: presetIndex
+                )
+            }
         )
         .id(PopupKeyboardNavModel.RowID.app(persistenceID: displayableApp.id))
     }
@@ -1135,6 +1205,7 @@ struct MenuBarPopupView: View {
                 oldPriority: audioEngine.settingsManager.devicePriorityOrder,
                 connectedOrder: connectedOrder
             )
+            audioEngine.reconcileMultiOutputPriority()
         }
     }
 

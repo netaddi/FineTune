@@ -268,7 +268,7 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
             // Update per-process listeners
             updateProcessListeners(for: processIDs)
 
-            let sorted = appsByPID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            let sorted = Self.coalesceLogicalApps(Array(appsByPID.values))
 
             // Only fire callback if the app list actually changed (avoids churn from periodic refresh)
             let oldSet = Set(activeApps.map { AppFingerprint(pid: $0.id, objectIDs: $0.processObjectIDs) })
@@ -281,6 +281,29 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
 
         } catch {
             logger.error("Failed to refresh process list: \(error.localizedDescription)")
+        }
+    }
+
+    /// CoreAudio may expose more than one responsible PID for one bundle (parallel app
+    /// instances or a relaunch overlap). One logical mixer strip must have one CATap producer,
+    /// so merge every process object into a single AudioApp before AudioEngine creates taps.
+    nonisolated static func coalesceLogicalApps(_ apps: [AudioApp]) -> [AudioApp] {
+        let grouped = Dictionary(grouping: apps, by: \.persistenceIdentifier)
+        return grouped.values.compactMap { group in
+            guard let representative = group.min(by: { $0.id < $1.id }) else { return nil }
+            let objectIDs = Array(Set(group.flatMap(\.processObjectIDs))).sorted()
+            return AudioApp(
+                id: representative.id,
+                processObjectIDs: objectIDs,
+                name: representative.name,
+                icon: representative.icon,
+                bundleID: representative.bundleID,
+                isHelperBacked: group.contains(where: \.isHelperBacked)
+            )
+        }
+        .sorted { lhs, rhs in
+            let nameOrder = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            return nameOrder == .orderedSame ? lhs.id < rhs.id : nameOrder == .orderedAscending
         }
     }
 

@@ -5,6 +5,11 @@
 /// CoreAudio HAL I/O thread, but the audio callback never goes through this
 /// protocol; it reads `nonisolated(unsafe)` atomic fields directly on the concrete
 /// type via a `void *` userdata pointer.
+struct DeviceAUEffectTransition: Sendable {
+    let entries: [AUEffectChainEntry]
+    let isBypassed: Bool
+}
+
 @MainActor
 protocol ProcessTapControlling: AnyObject, Sendable {
     var app: AudioApp { get }
@@ -18,23 +23,27 @@ protocol ProcessTapControlling: AnyObject, Sendable {
 
     func activate(initial: TapInitialState) throws
     func invalidate()
+    /// Blocking teardown used only when another producer will immediately inherit the
+    /// same persistent stateful AU instances.
+    func invalidateForHandoff()
     func invalidateAsync() async
     func updateEQSettings(_ settings: EQSettings)
     func updateAutoEQProfile(_ profile: AutoEQProfile?)
     func setAutoEQPreampEnabled(_ enabled: Bool)
     func updateLoudnessCompensation(volume: Float, enabled: Bool)
     func updateLoudnessEqualization(_ settings: LoudnessEqualizerSettings)
-    func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws
-    func updateDevices(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws
+    func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool, deviceAUTransition: DeviceAUEffectTransition?) async throws
+    func updateDevices(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool, deviceAUTransition: DeviceAUEffectTransition?) async throws
     func hasRecentAudioCallback(within seconds: Double) -> Bool
     func isHealthCheckEligible(minActiveSeconds: Double) -> Bool
 
     var tapSourceDeviceUID: String? { get }
-    func refreshTapSource(_ preferredDeviceUID: String?) async throws
-    func recreateForOutputRateChange() async throws
+    func refreshTapSource(_ preferredDeviceUID: String?, deviceAUTransition: DeviceAUEffectTransition?) async throws
+    func recreateForOutputRateChange(deviceAUTransition: DeviceAUEffectTransition?) async throws
 
     // AU effect chains
     func updateAUEffectChain(_ entries: [AUEffectChainEntry])
+    func attachPersistentAUEffectChain(_ chain: AUEffectChain?, entries: [AUEffectChainEntry])
     func getAUEffectChainEntries() -> [AUEffectChainEntry]
     func setAUChainBypassed(_ bypassed: Bool)
     var isAUChainBypassed: Bool { get }
@@ -54,27 +63,50 @@ extension ProcessTapControlling {
 
     /// Convenience: defaults sourceDeviceDead to false.
     func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?) async throws {
-        try await switchDevice(to: newDeviceUID, preferredTapSourceDeviceUID: preferredTapSourceDeviceUID, sourceDeviceDead: false)
+        try await switchDevice(
+            to: newDeviceUID,
+            preferredTapSourceDeviceUID: preferredTapSourceDeviceUID,
+            sourceDeviceDead: false,
+            deviceAUTransition: nil
+        )
     }
 
     /// Convenience: defaults sourceDeviceDead to false.
     func updateDevices(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?) async throws {
-        try await updateDevices(to: newDeviceUIDs, preferredTapSourceDeviceUID: preferredTapSourceDeviceUID, sourceDeviceDead: false)
+        try await updateDevices(
+            to: newDeviceUIDs,
+            preferredTapSourceDeviceUID: preferredTapSourceDeviceUID,
+            sourceDeviceDead: false,
+            deviceAUTransition: nil
+        )
     }
 
     func invalidateAsync() async {
         invalidate()
     }
 
+    func invalidateForHandoff() {
+        invalidate()
+    }
+
     func refreshTapSource(_ preferredDeviceUID: String?) async throws {
+        try await refreshTapSource(preferredDeviceUID, deviceAUTransition: nil)
+    }
+
+    func refreshTapSource(_ preferredDeviceUID: String?, deviceAUTransition: DeviceAUEffectTransition?) async throws {
         // Default no-op for mocks that don't override
     }
 
     func recreateForOutputRateChange() async throws {
+        try await recreateForOutputRateChange(deviceAUTransition: nil)
+    }
+
+    func recreateForOutputRateChange(deviceAUTransition: DeviceAUEffectTransition?) async throws {
         // Default no-op for mocks that don't override
     }
 
     func updateAUEffectChain(_ entries: [AUEffectChainEntry]) {}
+    func attachPersistentAUEffectChain(_ chain: AUEffectChain?, entries: [AUEffectChainEntry]) {}
     func getAUEffectChainEntries() -> [AUEffectChainEntry] { [] }
     func setAUChainBypassed(_ bypassed: Bool) {}
     var isAUChainBypassed: Bool { false }

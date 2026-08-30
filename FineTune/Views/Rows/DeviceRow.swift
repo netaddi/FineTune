@@ -221,7 +221,8 @@ struct DeviceRow: View {
                 onOpenGenericUI: onOpenDeviceAUGenericUI,
                 failedEntryIDs: deviceAUFailedEntryIDs,
                 getFactoryPresets: getDeviceAUFactoryPresets,
-                onSelectFactoryPreset: onSelectDeviceAUFactoryPreset
+                onSelectFactoryPreset: onSelectDeviceAUFactoryPreset,
+                allowsPlugin: { !$0.isSoftubeConsole1 }
             )
             .padding(.top, DesignTokens.Spacing.sm)
         }

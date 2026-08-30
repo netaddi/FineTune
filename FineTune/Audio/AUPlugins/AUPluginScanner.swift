@@ -11,6 +11,7 @@ final class AUPluginScanner {
     private(set) var hasNewPlugins = false
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AUPluginScanner")
+    @ObservationIgnored
     private nonisolated(unsafe) var registrationObserver: NSObjectProtocol?
 
     init() {
@@ -20,8 +21,10 @@ final class AUPluginScanner {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.refresh()
-            self?.hasNewPlugins = true
+            Task { @MainActor [weak self] in
+                self?.refresh()
+                self?.hasNewPlugins = true
+            }
         }
     }
 

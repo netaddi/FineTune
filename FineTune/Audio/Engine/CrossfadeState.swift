@@ -110,6 +110,12 @@ nonisolated struct CrossfadeState: @unchecked Sendable {
         progress >= 1.0
     }
 
+    /// Promotion is safe only after the secondary has both rendered a real warmup and
+    /// reached full crossfade gain. A timeout may force progress, but never warmup.
+    var isReadyForPromotion: Bool {
+        isWarmupComplete && isCrossfadeComplete
+    }
+
     /// Equal-power fade-out multiplier for primary tap.
     /// cos(0) = 1.0 (full volume), cos(pi/2) = 0.0 (silent)
     @inline(__always)

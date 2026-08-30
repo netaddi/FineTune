@@ -14,6 +14,9 @@ import os
 /// Violating this order can leak HAL resources or crash on shutdown.
 nonisolated struct TapResources {
     private static let logger = Logger(subsystem: "com.finetuneapp.FineTune", category: "TapResources")
+    /// Tracks fire-and-forget HAL teardown that may outlive its controller after a stale
+    /// tap or ignored app is removed from `AudioEngine.taps`.
+    private static let pendingDestructionGroup = DispatchGroup()
 
     var tapID: AudioObjectID = .unknown
     var aggregateDeviceID: AudioObjectID = .unknown
@@ -91,7 +94,13 @@ nonisolated struct TapResources {
         tapDescription = nil
 
         // Dispatch blocking teardown to background
+        Self.pendingDestructionGroup.enter()
         queue.async {
+            defer {
+                Self.pendingDestructionGroup.leave()
+                completion?()
+            }
+
             // Step 1 & 2: Stop and destroy IO proc
             if capturedAggregateID.isValid, let procID = capturedProcID {
                 let stopErr = AudioDeviceStop(capturedAggregateID, procID)
@@ -121,7 +130,35 @@ nonisolated struct TapResources {
                 }
             }
 
-            completion?()
         }
+    }
+
+    /// Submits both resource teardowns synchronously, then completes only after both have
+    /// finished. This is intentionally different from awaiting one `destroyAsync` before
+    /// submitting the next: process-exit code drains `pendingDestructionGroup`, which must
+    /// never observe a transient zero between a secondary and primary teardown belonging
+    /// to the same controller invalidation.
+    static func destroyPairAsync(
+        _ first: inout TapResources,
+        _ second: inout TapResources,
+        on queue: DispatchQueue = .global(qos: .utility),
+        completion: @escaping @Sendable () -> Void
+    ) {
+        let pairGroup = DispatchGroup()
+        pairGroup.enter()
+        first.destroyAsync(on: queue) {
+            pairGroup.leave()
+        }
+        pairGroup.enter()
+        second.destroyAsync(on: queue) {
+            pairGroup.leave()
+        }
+        pairGroup.notify(queue: queue, execute: completion)
+    }
+
+    /// Blocks until every previously submitted asynchronous HAL teardown has completed.
+    /// Call only after all main-actor producers have stopped scheduling new destruction.
+    static func waitForPendingDestruction() {
+        pendingDestructionGroup.wait()
     }
 }

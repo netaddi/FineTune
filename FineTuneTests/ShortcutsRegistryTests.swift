@@ -191,40 +191,68 @@ struct ShortcutsRegistryTests {
 
     // MARK: - start: load path
 
-    @Test("start() loads stored shortcuts into KeyboardShortcuts")
+    @Test("start() loads stored shortcuts into the registrar")
     func startLoadsStoredShortcuts() {
         let settings = makeIsolatedSettings()
+        let registrar = RecordingShortcutRegistrar()
         let stored = ShortcutCodable(keyCode: 9, modifiers: 0x12_0000)
         var app = settings.appSettings
         app.customShortcuts[ShortcutAction.togglePopup.rawValue] = stored
         settings.appSettings = app
 
-        let registry = makeRegistry(settings: settings)
+        let registry = makeRegistry(settings: settings, shortcutRegistrar: registrar)
         registry.start()
 
-        let resolved = KeyboardShortcuts.getShortcut(for: registry.name(for: .togglePopup))
+        let resolved = registrar.shortcuts[registry.name(for: .togglePopup).rawValue] ?? nil
         #expect(resolved?.carbonKeyCode == stored.keyCode)
         #expect(resolved?.carbonModifiers == stored.keyboardShortcut.carbonModifiers)
-
-        KeyboardShortcuts.setShortcut(nil, for: registry.name(for: .togglePopup))
     }
 
     @Test("start() is idempotent")
     func startIsIdempotent() {
         let settings = makeIsolatedSettings()
-        let registry = makeRegistry(settings: settings)
+        let registrar = RecordingShortcutRegistrar()
+        let registry = makeRegistry(settings: settings, shortcutRegistrar: registrar)
 
         registry.start()
         registry.start()
 
-        let recorder = RecordingPopupController()
-        let registryWithRecorder = makeRegistry(settings: settings, popupController: recorder)
-        registryWithRecorder.start()
-        registryWithRecorder.start()
-        registryWithRecorder.dispatch(.togglePopup)
-        #expect(recorder.toggleCount == 1)
+        for action in ShortcutAction.allCases {
+            let rawName = registry.name(for: action).rawValue
+            #expect(registrar.keyDownRegistrationCounts[rawName] == 1)
+            #expect(registrar.keyUpRegistrationCounts[rawName] == 1)
+        }
+    }
 
-        KeyboardShortcuts.setShortcut(nil, for: registry.name(for: .togglePopup))
+    @Test("start clears backend shortcuts that are absent from settings")
+    func startClearsAbsentBackendShortcuts() {
+        let registrar = RecordingShortcutRegistrar()
+        let registry = makeRegistry(shortcutRegistrar: registrar)
+
+        registry.start()
+
+        #expect(registrar.setCalls.count == ShortcutAction.allCases.count)
+        #expect(registrar.setCalls.allSatisfy { $0.shortcut == nil })
+    }
+
+    @Test("synchronizing after Reset All clears every backend shortcut")
+    func resetSynchronizationClearsBackendShortcuts() {
+        let settings = makeIsolatedSettings()
+        var app = settings.appSettings
+        app.customShortcuts[ShortcutAction.togglePopup.rawValue] = ShortcutCodable(
+            keyCode: 9,
+            modifiers: 0x12_0000
+        )
+        settings.appSettings = app
+        let registrar = RecordingShortcutRegistrar()
+        let registry = makeRegistry(settings: settings, shortcutRegistrar: registrar)
+        registry.start()
+
+        settings.resetAllSettings()
+        registry.synchronizeShortcutsFromSettings()
+
+        let resetCalls = registrar.setCalls.suffix(ShortcutAction.allCases.count)
+        #expect(resetCalls.allSatisfy { $0.shortcut == nil })
     }
 
     // MARK: - recordCallback: write-back path
@@ -264,14 +292,16 @@ struct ShortcutsRegistryTests {
         popupController: (any MenuBarPopupControlling)? = nil,
         resolver: (any TargetAppResolving)? = nil,
         audioEngine: (any AudioEngineDispatching)? = nil,
-        hud: (any PerAppHUDPresenting)? = nil
+        hud: (any PerAppHUDPresenting)? = nil,
+        shortcutRegistrar: (any ShortcutRegistering)? = nil
     ) -> ShortcutsRegistry {
         ShortcutsRegistry(
             settings: settings ?? makeIsolatedSettings(),
             popupController: popupController ?? RecordingPopupController(),
             resolver: resolver ?? StubTargetResolver(target: nil),
             audioEngine: audioEngine ?? RecordingAudioEngine(apps: []),
-            hud: hud ?? RecordingHUDController()
+            hud: hud ?? RecordingHUDController(),
+            shortcutRegistrar: shortcutRegistrar ?? RecordingShortcutRegistrar()
         )
     }
 
@@ -288,6 +318,27 @@ struct ShortcutsRegistryTests {
             icon: NSImage(systemSymbolName: "speaker", accessibilityDescription: nil) ?? NSImage(),
             bundleID: bundleID
         )
+    }
+}
+
+@MainActor
+private final class RecordingShortcutRegistrar: ShortcutRegistering {
+    var shortcuts: [String: KeyboardShortcuts.Shortcut?] = [:]
+    var setCalls: [(name: String, shortcut: KeyboardShortcuts.Shortcut?)] = []
+    var keyDownRegistrationCounts: [String: Int] = [:]
+    var keyUpRegistrationCounts: [String: Int] = [:]
+
+    func setShortcut(_ shortcut: KeyboardShortcuts.Shortcut?, for name: KeyboardShortcuts.Name) {
+        setCalls.append((name.rawValue, shortcut))
+        shortcuts[name.rawValue] = shortcut
+    }
+
+    func onKeyDown(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {
+        keyDownRegistrationCounts[name.rawValue, default: 0] += 1
+    }
+
+    func onKeyUp(for name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {
+        keyUpRegistrationCounts[name.rawValue, default: 0] += 1
     }
 }
 

@@ -23,6 +23,7 @@ final class RecordingProcessTapController: ProcessTapControlling {
         case updateLoudnessCompensation(volume: Float, enabled: Bool)
         case updateLoudnessEqualization(LoudnessEqualizerSettings)
         case invalidate
+        case invalidateForHandoff
     }
 
     /// Plain snapshot of `TapInitialState` so test asserts don't depend on
@@ -58,6 +59,8 @@ final class RecordingProcessTapController: ProcessTapControlling {
     private(set) var currentDeviceUIDs: [String]
     var currentDeviceUID: String? { currentDeviceUIDs.first }
     var tapSourceDeviceUID: String? = nil
+    private(set) var attachedAppAUChain: AUEffectChain?
+    private(set) var attachedAppAUEntries: [AUEffectChainEntry] = []
 
     init(app: AudioApp, deviceUIDs: [String]) {
         self.app = app
@@ -70,6 +73,10 @@ final class RecordingProcessTapController: ProcessTapControlling {
 
     func invalidate() {
         events.append(.invalidate)
+    }
+
+    func invalidateForHandoff() {
+        events.append(.invalidateForHandoff)
     }
 
     func updateEQSettings(_ settings: EQSettings) {
@@ -92,18 +99,36 @@ final class RecordingProcessTapController: ProcessTapControlling {
         events.append(.updateLoudnessEqualization(settings))
     }
 
-    func switchDevice(to newDeviceUID: String, preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws {
+    func attachPersistentAUEffectChain(_ chain: AUEffectChain?, entries: [AUEffectChainEntry]) {
+        attachedAppAUChain = chain
+        attachedAppAUEntries = entries
+    }
+
+    func switchDevice(
+        to newDeviceUID: String,
+        preferredTapSourceDeviceUID: String?,
+        sourceDeviceDead: Bool,
+        deviceAUTransition: DeviceAUEffectTransition?
+    ) async throws {
         currentDeviceUIDs = [newDeviceUID]
     }
 
-    func updateDevices(to newDeviceUIDs: [String], preferredTapSourceDeviceUID: String?, sourceDeviceDead: Bool) async throws {
+    func updateDevices(
+        to newDeviceUIDs: [String],
+        preferredTapSourceDeviceUID: String?,
+        sourceDeviceDead: Bool,
+        deviceAUTransition: DeviceAUEffectTransition?
+    ) async throws {
         currentDeviceUIDs = newDeviceUIDs
     }
 
     func hasRecentAudioCallback(within seconds: Double) -> Bool { false }
     func isHealthCheckEligible(minActiveSeconds: Double) -> Bool { false }
 
-    func refreshTapSource(_ preferredDeviceUID: String?) async throws {}
+    func refreshTapSource(
+        _ preferredDeviceUID: String?,
+        deviceAUTransition: DeviceAUEffectTransition?
+    ) async throws {}
 }
 
 // MARK: - Process monitor stub
@@ -175,7 +200,10 @@ private func makeFixture(
     let engine = AudioEngine(
         permission: permission,
         settingsManager: settings,
-        autoEQProfileManager: AutoEQProfileManager(),
+        autoEQProfileManager: AutoEQProfileManager(
+            loadPersistedProfiles: false,
+            loadCatalog: false
+        ),
         deviceProvider: deviceMonitor,
         processMonitor: processMonitor,
         deviceVolumeMonitor: mockVolume,
@@ -208,6 +236,353 @@ private final class TapBox {
 @Suite("AudioEngine.tapInitialState — first-sound fix (PR-1)")
 @MainActor
 struct AudioEngineTapInitialStateTests {
+
+    @Test("A relaunch retires the old producer before reusing the persistent AU instances")
+    func sameAppRelaunchHandsOffPersistentAUInstances() throws {
+        let fix = makeFixture()
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x64656C79, // 'dely'
+            componentManufacturer: 0x6170706C, // 'appl'
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let entry = AUEffectChainEntry(plugin: descriptor)
+        fix.settings.setAUEffectChain([entry], for: fix.app.persistenceIdentifier)
+        fix.engine.pinApp(fix.app)
+
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let firstTap = try #require(fix.lastTap())
+        let firstChain = try #require(firstTap.attachedAppAUChain)
+        let firstHost = try #require(firstChain.host(for: entry.id))
+        let firstAudioUnit = try #require(firstHost.audioUnit)
+
+        let relaunchedApp = AudioApp(
+            id: fix.app.id + 1,
+            processObjectIDs: [101, 102],
+            name: fix.app.name,
+            icon: NSImage(),
+            bundleID: fix.app.bundleID
+        )
+        fix.engine.setDevice(for: relaunchedApp, deviceUID: fix.device.uid)
+        let relaunchedTap = try #require(fix.lastTap())
+
+        #expect(relaunchedTap !== firstTap)
+        #expect(firstTap.events.last == .invalidateForHandoff)
+        #expect(!firstTap.events.contains(.invalidate))
+        #expect(relaunchedTap.attachedAppAUChain === firstChain)
+        #expect(relaunchedTap.attachedAppAUChain?.host(for: entry.id) === firstHost)
+        #expect(relaunchedTap.attachedAppAUChain?.host(for: entry.id)?.audioUnit == firstAudioUnit)
+        #expect(relaunchedTap.attachedAppAUEntries.map(\.id) == [entry.id])
+    }
+
+    @Test("Process exit synchronously retires HAL resources without ordinary invalidation")
+    func processExitUsesSynchronousTapTeardown() throws {
+        let fix = makeFixture()
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+        let tap = try #require(fix.lastTap())
+
+        fix.engine.prepareForProcessExit()
+
+        #expect(tap.events.contains(.invalidateForHandoff))
+        #expect(!tap.events.contains(.invalidate))
+    }
+
+    @Test("Pending asynchronous HAL teardown can be drained before process exit")
+    func pendingTapResourceDestructionIsDrainable() {
+        let destructionQueue = DispatchQueue(label: "TapResourcesTests.suspended-destruction")
+        destructionQueue.suspend()
+        var resources = TapResources()
+        resources.destroyAsync(on: destructionQueue)
+
+        let completed = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            TapResources.waitForPendingDestruction()
+            completed.signal()
+        }
+        let resultBeforeResume = completed.wait(timeout: .now() + .milliseconds(50))
+        destructionQueue.resume()
+
+        #expect(resultBeforeResume == .timedOut)
+        #expect(completed.wait(timeout: .now() + .seconds(2)) == .success)
+    }
+
+    @Test("Paired async teardown registers primary before secondary completion can expose zero pending work")
+    func pairedTapResourceDestructionHasNoSubmissionGap() {
+        let destructionQueue = DispatchQueue(label: "TapResourcesTests.suspended-pair")
+        destructionQueue.suspend()
+        var secondary = TapResources()
+        var primary = TapResources()
+        let pairCompleted = DispatchSemaphore(value: 0)
+        TapResources.destroyPairAsync(
+            &secondary,
+            &primary,
+            on: destructionQueue
+        ) {
+            pairCompleted.signal()
+        }
+
+        let globalDrainCompleted = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            TapResources.waitForPendingDestruction()
+            globalDrainCompleted.signal()
+        }
+        let resultBeforeResume = globalDrainCompleted.wait(timeout: .now() + .milliseconds(50))
+        destructionQueue.resume()
+
+        #expect(resultBeforeResume == .timedOut)
+        #expect(pairCompleted.wait(timeout: .now() + .seconds(2)) == .success)
+        #expect(globalDrainCompleted.wait(timeout: .now() + .seconds(2)) == .success)
+    }
+
+    @Test("Device AU edits preserve persisted chains before any tap is active")
+    func inactiveDeviceAUEditUsesPersistedState() {
+        let fix = makeFixture()
+        let original = AUEffectChainEntry(plugin: AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6465_6C79,
+            componentManufacturer: 0x6170_706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        ))
+        let addedPlugin = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowpass",
+            manufacturer: "Apple",
+            version: 1
+        )
+        fix.settings.setDeviceAUEffectChain([original], for: fix.device.uid)
+
+        fix.engine.addDeviceAUEffect(deviceUID: fix.device.uid, plugin: addedPlugin)
+
+        let loaded = fix.settings.getDeviceAUEffectChain(for: fix.device.uid)
+        #expect(loaded.count == 2)
+        #expect(loaded.first?.id == original.id)
+        #expect(loaded.last?.pluginDescriptor == addedPlugin)
+        #expect(fix.engine.getDeviceAUEffectChain(deviceUID: fix.device.uid) == loaded)
+        #expect(fix.lastTap() === nil)
+    }
+
+    @Test("Process monitor coalesces concurrent PIDs into one logical CATap input")
+    func coalescesConcurrentPIDsByPersistenceIdentifier() throws {
+        let first = AudioApp(
+            id: 100,
+            processObjectIDs: [11, 12],
+            name: "Browser",
+            icon: NSImage(),
+            bundleID: "com.test.browser"
+        )
+        let second = AudioApp(
+            id: 200,
+            processObjectIDs: [21],
+            name: "Browser",
+            icon: NSImage(),
+            bundleID: "com.test.browser"
+        )
+
+        let merged = AudioProcessMonitor.coalesceLogicalApps([second, first])
+        let app = try #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(app.id == 100)
+        #expect(app.processObjectIDs == [11, 12, 21])
+    }
+
+    @Test("Changing output priority reorders an existing multi-output tap")
+    func priorityChangeReordersMultiOutputTap() async throws {
+        let fix = makeFixture()
+        let second = AudioDevice(
+            id: AudioDeviceID(100),
+            uid: "uid-second",
+            name: "Second Output",
+            icon: nil,
+            supportsAutoEQ: false
+        )
+        fix.deviceMonitor.addOutputDevice(second)
+        fix.settings.setDevicePriorityOrder([fix.device.uid, second.uid])
+        fix.engine.volumeState.setDeviceSelectionMode(
+            for: fix.app.id,
+            to: .multi,
+            identifier: fix.app.persistenceIdentifier
+        )
+        fix.engine.volumeState.setSelectedDeviceUIDs(
+            for: fix.app.id,
+            to: [fix.device.uid, second.uid],
+            identifier: fix.app.persistenceIdentifier
+        )
+
+        fix.engine.reconcileMultiOutputPriority()
+        for _ in 0..<20 where fix.lastTap() == nil { await Task.yield() }
+        let tap = try #require(fix.lastTap())
+        #expect(tap.currentDeviceUIDs == [fix.device.uid, second.uid])
+
+        fix.settings.setDevicePriorityOrder([second.uid, fix.device.uid])
+        fix.engine.reconcileMultiOutputPriority()
+        for _ in 0..<20 where tap.currentDeviceUIDs.first != second.uid { await Task.yield() }
+
+        #expect(tap.currentDeviceUIDs == [second.uid, fix.device.uid])
+        #expect(fix.engine.getDeviceUID(for: fix.app) == second.uid)
+    }
+
+    @Test("Pinned inactive multi-output Primary previews its next activation order")
+    func inactivePrimaryUsesMultiOutputPriority() {
+        let fix = makeFixture()
+        let second = AudioDevice(
+            id: AudioDeviceID(100),
+            uid: "uid-second",
+            name: "Second Output",
+            icon: nil,
+            supportsAutoEQ: false
+        )
+        fix.deviceMonitor.addOutputDevice(second)
+        let identifier = fix.app.persistenceIdentifier
+        fix.engine.setDeviceRoutingForInactive(identifier: identifier, deviceUID: fix.device.uid)
+        fix.engine.setDeviceSelectionModeForInactive(identifier: identifier, to: .multi)
+        fix.engine.setSelectedDeviceUIDsForInactive(
+            identifier: identifier,
+            to: [fix.device.uid, second.uid]
+        )
+
+        fix.settings.setDevicePriorityOrder([second.uid, fix.device.uid])
+
+        #expect(fix.engine.getPrimaryDeviceUIDForInactive(identifier: identifier) == second.uid)
+        #expect(fix.engine.getDeviceRoutingForInactive(identifier: identifier) == fix.device.uid)
+    }
+
+    @Test("Ignoring a pinned inactive app cannot resurrect its live AU state")
+    func inactiveIgnoreRemovesPersistentStripBeforeSave() {
+        let fix = makeFixture()
+        let entry = AUEffectChainEntry(
+            plugin: AUPluginDescriptor(
+                componentType: kAudioUnitType_Effect,
+                componentSubType: 0x6465_6C79,
+                componentManufacturer: 0x6170_706C,
+                name: "AUDelay",
+                manufacturer: "Apple",
+                version: 1
+            )
+        )
+        fix.settings.setAUEffectChain([entry], for: fix.app.persistenceIdentifier)
+        fix.engine.pinApp(fix.app)
+
+        fix.engine.ignoreApp(
+            identifier: fix.app.persistenceIdentifier,
+            displayName: fix.app.name,
+            bundleID: fix.app.bundleID
+        )
+        fix.engine.saveAllLiveAUState()
+
+        #expect(fix.settings.isIgnored(fix.app.persistenceIdentifier))
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier).isEmpty)
+        #expect(fix.engine.getAUEffectChain(forIdentifier: fix.app.persistenceIdentifier).isEmpty)
+    }
+
+    @Test("App AU commits normalize duplicate Console 1 entries in the live strip")
+    func liveAppAUCommitUsesNormalizedConsoleChain() {
+        let fix = makeFixture()
+        let consoleDescriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x5363_5069,
+            componentManufacturer: 0x5366_5462,
+            name: "Console 1",
+            manufacturer: "Softube",
+            version: 1
+        )
+        var firstConsole = AUEffectChainEntry(plugin: consoleDescriptor)
+        firstConsole.isEnabled = false
+        firstConsole.isCrashQuarantined = true
+        let generic = AUEffectChainEntry(plugin: AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6465_6C79,
+            componentManufacturer: 0x6170_706C,
+            name: "AUDelay",
+            manufacturer: "Apple",
+            version: 1
+        ))
+        var duplicateConsole = AUEffectChainEntry(plugin: consoleDescriptor)
+        duplicateConsole.isEnabled = false
+        duplicateConsole.isCrashQuarantined = true
+
+        fix.engine.reorderAUEffects(
+            for: fix.app,
+            entries: [firstConsole, generic, duplicateConsole]
+        )
+
+        let expectedIDs = [firstConsole.id, generic.id]
+        #expect(fix.engine.getAUEffectChain(for: fix.app).map(\.id) == expectedIDs)
+        #expect(fix.settings.getAUEffectChain(for: fix.app.persistenceIdentifier).map(\.id) == expectedIDs)
+    }
+
+    @Test("Ignore clears live audio state so unignore starts from defaults")
+    func ignoreClearsVolumeStateForLogicalApp() {
+        let fix = makeFixture()
+        let identifier = fix.app.persistenceIdentifier
+
+        fix.engine.volumeState.setVolume(for: fix.app.id, to: 0.2, identifier: identifier)
+        fix.engine.volumeState.setBoost(for: fix.app.id, to: .x4, identifier: identifier)
+        fix.engine.volumeState.setMute(for: fix.app.id, to: true, identifier: identifier)
+        fix.engine.volumeState.setDeviceSelectionMode(for: fix.app.id, to: .multi, identifier: identifier)
+        fix.engine.volumeState.setSelectedDeviceUIDs(
+            for: fix.app.id,
+            to: [fix.device.uid],
+            identifier: identifier
+        )
+
+        fix.engine.ignoreApp(
+            identifier: identifier,
+            displayName: fix.app.name,
+            bundleID: fix.app.bundleID
+        )
+        fix.engine.unignoreApp(identifier)
+
+        #expect(fix.engine.getVolume(for: fix.app) == fix.settings.appSettings.defaultNewAppVolume)
+        #expect(fix.engine.getBoost(for: fix.app) == .x1)
+        #expect(!fix.engine.getMute(for: fix.app))
+        #expect(fix.engine.getDeviceSelectionMode(for: fix.app) == .single)
+        #expect(fix.engine.getSelectedDeviceUIDs(for: fix.app).isEmpty)
+    }
+
+    @Test("Selecting Default discards unsaved edits from an editor that is still open")
+    func unsavedLiveEditThenDefaultRestoresBaseline() throws {
+        let fix = makeFixture()
+        let descriptor = AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: 0x6C70_6173,
+            componentManufacturer: 0x6170_706C,
+            name: "AULowPassFilter",
+            manufacturer: "Apple",
+            version: 1
+        )
+        let entry = AUEffectChainEntry(plugin: descriptor)
+        fix.settings.setAUEffectChain([entry], for: fix.app.persistenceIdentifier)
+        fix.engine.pinApp(fix.app)
+        fix.engine.setDevice(for: fix.app, deviceUID: fix.device.uid)
+
+        let tap = try #require(fix.lastTap())
+        let chain = try #require(tap.attachedAppAUChain)
+        let host = try #require(chain.host(for: entry.id))
+        let au = try #require(host.audioUnit)
+        var baseline: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(au, 0, kAudioUnitScope_Global, 0, &baseline) == noErr)
+        #expect(AudioUnitSetParameter(au, 0, kAudioUnitScope_Global, 0, 200, 0) == noErr)
+
+        fix.engine.selectAUFactoryPreset(
+            forIdentifier: fix.app.persistenceIdentifier,
+            displayName: fix.app.name,
+            entryID: entry.id,
+            presetIndex: -1
+        )
+
+        let rebuiltChain = try #require(tap.attachedAppAUChain)
+        var restored: AudioUnitParameterValue = 0
+        #expect(AudioUnitGetParameter(au, 0, kAudioUnitScope_Global, 0, &restored) == noErr)
+        #expect(rebuiltChain.host(for: entry.id) === host)
+        #expect(rebuiltChain.host(for: entry.id)?.audioUnit == au)
+        #expect(abs(restored - baseline) < 0.001)
+    }
 
     // MARK: Single-knob derivation
 
@@ -390,7 +765,7 @@ struct AudioEngineTapInitialStateTests {
             case .updateEQSettings, .updateAutoEQProfile, .setAutoEQPreampEnabled,
                  .updateLoudnessCompensation, .updateLoudnessEqualization:
                 Issue.record("Pre-activate mutation breaks the apply-initial-state contract: \(event)")
-            case .activate, .invalidate:
+            case .activate, .invalidate, .invalidateForHandoff:
                 break
             }
         }

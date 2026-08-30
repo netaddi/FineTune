@@ -34,6 +34,9 @@ struct AppRow: View {
     let isEQExpanded: Bool
     let onEQToggle: () -> Void
     let isFocused: Bool
+    let mixerStripSlot: Int?
+    let mixerStripSlotCount: Int
+    let onMixerStripSlotChange: (Int) -> Void
 
     // AU effect chain
     let auEffectChain: [AUEffectChainEntry]
@@ -86,6 +89,9 @@ struct AppRow: View {
         isEQExpanded: Bool = false,
         onEQToggle: @escaping () -> Void = {},
         isFocused: Bool = false,
+        mixerStripSlot: Int? = nil,
+        mixerStripSlotCount: Int = 1,
+        onMixerStripSlotChange: @escaping (Int) -> Void = { _ in },
         auEffectChain: [AUEffectChainEntry] = [],
         isAUChainBypassed: Bool = false,
         auPluginScanner: AUPluginScanner? = nil,
@@ -132,6 +138,9 @@ struct AppRow: View {
         self.isEQExpanded = isEQExpanded
         self.onEQToggle = onEQToggle
         self.isFocused = isFocused
+        self.mixerStripSlot = mixerStripSlot
+        self.mixerStripSlotCount = mixerStripSlotCount
+        self.onMixerStripSlotChange = onMixerStripSlotChange
         self.auEffectChain = auEffectChain
         self.isAUChainBypassed = isAUChainBypassed
         self.auPluginScanner = auPluginScanner
@@ -186,18 +195,24 @@ struct AppRow: View {
                         .lineLimit(1)
                         .help(app.name)
 
-                    if let subtitle = DevicePicker.routingSubtitle(
-                        devices: devices,
-                        selectedDeviceUID: selectedDeviceUID,
-                        selectedDeviceUIDs: selectedDeviceUIDs,
-                        isFollowingDefault: isFollowingDefault,
-                        mode: deviceSelectionMode
-                    ) {
-                        Text(subtitle)
-                            .font(.system(size: 9))
-                            .foregroundStyle(DesignTokens.Colors.textTertiary)
-                            .lineLimit(1)
+                    HStack(spacing: DesignTokens.Spacing.xs) {
+                        if let mixerStripSlot {
+                            Text("Console order #\(mixerStripSlot) next launch")
+                                .foregroundStyle(DesignTokens.Colors.accentPrimary)
+                        }
+                        if let subtitle = DevicePicker.routingSubtitle(
+                            devices: devices,
+                            selectedDeviceUID: selectedDeviceUID,
+                            selectedDeviceUIDs: selectedDeviceUIDs,
+                            isFollowingDefault: isFollowingDefault,
+                            mode: deviceSelectionMode
+                        ) {
+                            Text(subtitle)
+                                .foregroundStyle(DesignTokens.Colors.textTertiary)
+                        }
                     }
+                    .font(.system(size: 9))
+                    .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -227,6 +242,14 @@ struct AppRow: View {
             }
             .frame(height: DesignTokens.Dimensions.rowContentHeight)
         } expandedContent: {
+            if let mixerStripSlot {
+                PersistentMixerStripControl(
+                    slot: mixerStripSlot,
+                    maximumSlot: mixerStripSlotCount,
+                    onChange: onMixerStripSlotChange
+                )
+            }
+
             // EQ panel - shown when expanded
             // SwiftUI calculates natural height via conditional rendering
             EQPanelView(
@@ -265,7 +288,11 @@ struct AppRow: View {
                     onOpenGenericUI: onOpenAUGenericUI,
                     failedEntryIDs: auFailedEntryIDs,
                     getFactoryPresets: getAUFactoryPresets,
-                    onSelectFactoryPreset: onSelectAUFactoryPreset
+                    onSelectFactoryPreset: onSelectAUFactoryPreset,
+                    allowsPlugin: { plugin in
+                        !plugin.isSoftubeConsole1
+                            || !auEffectChain.contains(where: { $0.pluginDescriptor.isSoftubeConsole1 })
+                    }
                 )
             }
         }

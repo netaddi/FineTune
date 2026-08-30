@@ -4,6 +4,40 @@ import os
 import ServiceManagement
 import AppKit
 
+@MainActor
+protocol LaunchAtLoginServicing: AnyObject {
+    var isEnabled: Bool { get }
+    func setEnabled(_ enabled: Bool) throws
+}
+
+@MainActor
+private final class SystemLaunchAtLoginService: LaunchAtLoginServicing {
+    var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    func setEnabled(_ enabled: Bool) throws {
+        if enabled {
+            try SMAppService.mainApp.register()
+        } else {
+            try SMAppService.mainApp.unregister()
+        }
+    }
+}
+
+/// Console 1 exposes a hardware-controlled strip per Audio Unit instance. A logical app
+/// must therefore own at most one instance: preserve the first occurrence and leave the
+/// relative order of every other effect unchanged when repairing imported or stale state.
+private func appChainWithSingleConsole(
+    _ chain: [AUEffectChainEntry]
+) -> [AUEffectChainEntry] {
+    var foundConsole = false
+    return chain.filter { entry in
+        guard entry.pluginDescriptor.isSoftubeConsole1 else { return true }
+        guard !foundConsole else { return false }
+        foundConsole = true
+        return true
+    }
+}
+
 // MARK: - Pinned App Info
 
 struct PinnedAppInfo: Codable, Equatable {
@@ -88,11 +122,16 @@ nonisolated struct AppSettings: Codable, Equatable {
 final class SettingsManager {
     private var settings: Settings
     private var saveTask: Task<Void, Never>?
+    /// Serializes every disk write. `flushSync()` drains older snapshots before writing
+    /// the final one, so a previously queued debounce save can never win after shutdown.
+    private let saveQueue: DispatchQueue
     private let settingsURL: URL
+    /// nil for custom-directory test/preview instances unless a fake is injected.
+    private let launchAtLoginService: (any LaunchAtLoginServicing)?
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "SettingsManager")
 
     struct Settings: Codable {
-        var version: Int = 12
+        var version: Int = 13
         var appVolumes: [String: Float] = [:]
         var appDeviceRouting: [String: String] = [:]  // bundleID → deviceUID
         var appMutes: [String: Bool] = [:]  // bundleID → isMuted
@@ -112,6 +151,9 @@ final class SettingsManager {
         var preferredInputDeviceUID: String? = nil  // User's intended input device (survives disconnect)
         var pinnedApps: Set<String> = []  // Persistence identifiers of pinned apps
         var pinnedAppInfo: [String: PinnedAppInfo] = [:]  // Persistence identifier → app metadata
+        /// Stable logical mixer positions. FineTune instantiates pinned app AU chains in
+        /// this order so non-integrated hosts such as Console 1 receive deterministic tracks.
+        var appMixerStripSlots: [String: Int] = [:]  // Persistence identifier → 1-based slot
         var ignoredApps: Set<String> = []  // Persistence identifiers of hidden apps
         var ignoredAppInfo: [String: IgnoredAppInfo] = [:]  // Persistence identifier → app metadata
 
@@ -151,7 +193,8 @@ final class SettingsManager {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 9
+            _ = try c.decodeIfPresent(Int.self, forKey: .version) ?? 9
+            version = 13
             appVolumes = (try c.decodeIfPresent([String: Float].self, forKey: .appVolumes) ?? [:])
                 .filter { $0.value.isFinite && $0.value >= 0 }
                 .mapValues { min($0, 1.0) }  // Clamp old volumes > 1.0 (boost is now per-app)
@@ -159,8 +202,25 @@ final class SettingsManager {
             appMutes = try c.decodeIfPresent([String: Bool].self, forKey: .appMutes) ?? [:]
             appBoosts = try c.decodeIfPresent([String: Float].self, forKey: .appBoosts) ?? [:]
             appEQSettings = try c.decodeIfPresent([String: EQSettings].self, forKey: .appEQSettings) ?? [:]
-            appAUEffectChains = try c.decodeIfPresent([String: [AUEffectChainEntry]].self, forKey: .appAUEffectChains) ?? [:]
-            deviceAUEffectChains = try c.decodeIfPresent([String: [AUEffectChainEntry]].self, forKey: .deviceAUEffectChains) ?? [:]
+            let decodedAppChains = try c.decodeIfPresent(
+                [String: [AUEffectChainEntry]].self,
+                forKey: .appAUEffectChains
+            ) ?? [:]
+            appAUEffectChains = decodedAppChains.compactMapValues { chain in
+                let repaired = appChainWithSingleConsole(chain)
+                return repaired.isEmpty ? nil : repaired
+            }
+            let decodedDeviceChains = try c.decodeIfPresent(
+                [String: [AUEffectChainEntry]].self,
+                forKey: .deviceAUEffectChains
+            ) ?? [:]
+            deviceAUEffectChains = decodedDeviceChains.compactMapValues { chain in
+                // Older FineTune releases allowed Console 1 on a device chain, which
+                // creates one Console instance per app tap and destroys stable track
+                // identity. Device chains are generic-AU-only from schema 13 onward.
+                let supported = chain.filter { !$0.pluginDescriptor.isSoftubeConsole1 }
+                return supported.isEmpty ? nil : supported
+            }
             favoriteAUPlugins = try c.decodeIfPresent(Set<String>.self, forKey: .favoriteAUPlugins) ?? []
             auPluginCrashHistory = try c.decodeIfPresent(Set<String>.self, forKey: .auPluginCrashHistory) ?? []
             appAUBypassed = try c.decodeIfPresent([String: Bool].self, forKey: .appAUBypassed) ?? [:]
@@ -178,6 +238,25 @@ final class SettingsManager {
             preferredInputDeviceUID = try c.decodeIfPresent(String.self, forKey: .preferredInputDeviceUID)
             pinnedApps = try c.decodeIfPresent(Set<String>.self, forKey: .pinnedApps) ?? []
             pinnedAppInfo = try c.decodeIfPresent([String: PinnedAppInfo].self, forKey: .pinnedAppInfo) ?? [:]
+            let decodedMixerSlots = try c.decodeIfPresent([String: Int].self, forKey: .appMixerStripSlots) ?? [:]
+            let consoleStripIdentifiers = pinnedApps.filter { identifier in
+                appAUEffectChains[identifier, default: []].filter(\.isConsole1TrackEligible).count == 1
+            }
+            let orderedPinnedIdentifiers = consoleStripIdentifiers.sorted { lhs, rhs in
+                let rawLhsSlot = decodedMixerSlots[lhs]
+                let rawRhsSlot = decodedMixerSlots[rhs]
+                let lhsSlot = rawLhsSlot.map { $0 > 0 ? $0 : Int.max } ?? Int.max
+                let rhsSlot = rawRhsSlot.map { $0 > 0 ? $0 : Int.max } ?? Int.max
+                if lhsSlot != rhsSlot { return lhsSlot < rhsSlot }
+                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+            }
+            var normalizedMixerSlots: [String: Int] = [:]
+            for (index, identifier) in orderedPinnedIdentifiers.enumerated() {
+                // This is an ordering domain only for strips that instantiate exactly one
+                // non-quarantined Console 1. Empty/generic/malformed chains must not shift it.
+                normalizedMixerSlots[identifier] = index + 1
+            }
+            appMixerStripSlots = normalizedMixerSlots
             ignoredApps = try c.decodeIfPresent(Set<String>.self, forKey: .ignoredApps) ?? []
             ignoredAppInfo = try c.decodeIfPresent([String: IgnoredAppInfo].self, forKey: .ignoredAppInfo) ?? [:]
             ddcVolumes = try c.decodeIfPresent([String: Int].self, forKey: .ddcVolumes) ?? [:]
@@ -203,7 +282,17 @@ final class SettingsManager {
         }
     }
 
-    init(directory: URL? = nil) {
+    init(
+        directory: URL? = nil,
+        launchAtLoginService: (any LaunchAtLoginServicing)? = nil,
+        saveQueue: DispatchQueue? = nil
+    ) {
+        self.saveQueue = saveQueue ?? DispatchQueue(
+            label: "com.finetuneapp.FineTune.settings-write",
+            qos: .utility
+        )
+        self.launchAtLoginService = launchAtLoginService
+            ?? (directory == nil ? SystemLaunchAtLoginService() : nil)
         let baseDir = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!.appendingPathComponent("FineTune")
         self.settingsURL = baseDir.appendingPathComponent("settings.json")
         self.settings = Settings()
@@ -285,27 +374,35 @@ final class SettingsManager {
     // MARK: - AU Effect Chains
 
     func getAUEffectChain(for appIdentifier: String) -> [AUEffectChainEntry] {
-        settings.appAUEffectChains[appIdentifier] ?? []
+        appChainWithSingleConsole(settings.appAUEffectChains[appIdentifier] ?? [])
     }
 
     func setAUEffectChain(_ chain: [AUEffectChainEntry], for appIdentifier: String) {
-        if chain.isEmpty {
+        // Picker state, drag/reorder callbacks, and imported settings can all outlive the
+        // view that originally enforced this rule. Keep the persistence boundary strict.
+        let supported = appChainWithSingleConsole(chain)
+        if supported.isEmpty {
             settings.appAUEffectChains.removeValue(forKey: appIdentifier)
         } else {
-            settings.appAUEffectChains[appIdentifier] = chain
+            settings.appAUEffectChains[appIdentifier] = supported
         }
+        reconcileMixerStripSlots()
         scheduleSave()
     }
 
     func getDeviceAUEffectChain(for deviceUID: String) -> [AUEffectChainEntry] {
-        settings.deviceAUEffectChains[deviceUID] ?? []
+        (settings.deviceAUEffectChains[deviceUID] ?? [])
+            .filter { !$0.pluginDescriptor.isSoftubeConsole1 }
     }
 
     func setDeviceAUEffectChain(_ chain: [AUEffectChainEntry], for deviceUID: String) {
-        if chain.isEmpty {
+        // Runtime defense in depth for stale UI state and imported settings. Console 1
+        // is owned exclusively by persistent per-app strips.
+        let supported = chain.filter { !$0.pluginDescriptor.isSoftubeConsole1 }
+        if supported.isEmpty {
             settings.deviceAUEffectChains.removeValue(forKey: deviceUID)
         } else {
-            settings.deviceAUEffectChains[deviceUID] = chain
+            settings.deviceAUEffectChains[deviceUID] = supported
         }
         scheduleSave()
     }
@@ -355,6 +452,7 @@ final class SettingsManager {
             var changed = false
             for i in updated.indices where crashedIDs.contains(updated[i].pluginDescriptor.id) {
                 updated[i].isEnabled = false
+                updated[i].isCrashQuarantined = true
                 changed = true
             }
             if changed { settings.appAUEffectChains[appID] = updated }
@@ -364,10 +462,12 @@ final class SettingsManager {
             var changed = false
             for i in updated.indices where crashedIDs.contains(updated[i].pluginDescriptor.id) {
                 updated[i].isEnabled = false
+                updated[i].isCrashQuarantined = true
                 changed = true
             }
             if changed { settings.deviceAUEffectChains[deviceUID] = updated }
         }
+        reconcileMixerStripSlots()
         scheduleSave()
     }
 
@@ -447,12 +547,14 @@ final class SettingsManager {
     func pinApp(_ identifier: String, info: PinnedAppInfo) {
         settings.pinnedApps.insert(identifier)
         settings.pinnedAppInfo[identifier] = info
+        reconcileMixerStripSlots()
         scheduleSave()
     }
 
     func unpinApp(_ identifier: String) {
         settings.pinnedApps.remove(identifier)
         settings.pinnedAppInfo.removeValue(forKey: identifier)
+        removeMixerStripSlot(for: identifier)
         scheduleSave()
     }
 
@@ -462,7 +564,78 @@ final class SettingsManager {
 
     /// Returns metadata for all pinned apps
     func getPinnedAppInfo() -> [PinnedAppInfo] {
-        settings.pinnedApps.compactMap { settings.pinnedAppInfo[$0] }
+        settings.pinnedApps
+            .compactMap { settings.pinnedAppInfo[$0] }
+            .sorted { lhs, rhs in
+                let lhsSlot = settings.appMixerStripSlots[lhs.persistenceIdentifier] ?? Int.max
+                let rhsSlot = settings.appMixerStripSlots[rhs.persistenceIdentifier] ?? Int.max
+                if lhsSlot != rhsSlot { return lhsSlot < rhsSlot }
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+    }
+
+    /// Returns the 1-based deterministic startup position for a pinned app.
+    func getMixerStripSlot(for identifier: String) -> Int? {
+        guard settings.pinnedApps.contains(identifier) else { return nil }
+        return settings.appMixerStripSlots[identifier]
+    }
+
+    /// Moves a pinned app to a logical slot. If occupied, the two apps swap positions.
+    /// Existing AU instances remain alive; the new creation order takes effect next launch.
+    func setMixerStripSlot(_ requestedSlot: Int, for identifier: String) {
+        guard settings.pinnedApps.contains(identifier),
+              settings.appMixerStripSlots[identifier] != nil else { return }
+        let slot = min(max(requestedSlot, 1), max(settings.appMixerStripSlots.count, 1))
+        let fallbackSlot = nextAvailableMixerStripSlot()
+        let previousSlot = settings.appMixerStripSlots[identifier] ?? fallbackSlot
+
+        if let occupant = settings.appMixerStripSlots.first(where: {
+            $0.key != identifier && $0.value == slot
+        })?.key {
+            settings.appMixerStripSlots[occupant] = previousSlot
+        }
+        settings.appMixerStripSlots[identifier] = slot
+        scheduleSave()
+    }
+
+    var mixerStripSlots: [String: Int] {
+        settings.appMixerStripSlots
+    }
+
+    private func nextAvailableMixerStripSlot() -> Int {
+        let used = Set(settings.appMixerStripSlots.values)
+        var candidate = 1
+        while used.contains(candidate) { candidate += 1 }
+        return candidate
+    }
+
+    private func removeMixerStripSlot(for identifier: String) {
+        guard let removedSlot = settings.appMixerStripSlots.removeValue(forKey: identifier) else {
+            return
+        }
+        let higherSlots = settings.appMixerStripSlots.filter { $0.value > removedSlot }
+        for (otherIdentifier, slot) in higherSlots {
+            settings.appMixerStripSlots[otherIdentifier] = slot - 1
+        }
+    }
+
+    /// Keeps Console startup positions contiguous while preserving the user's existing
+    /// relative order. A position exists only for a pinned chain with exactly one non-quarantined
+    /// Console 1 instance; other AUs do not consume a Console track.
+    private func reconcileMixerStripSlots() {
+        let eligible = settings.pinnedApps.filter { identifier in
+            settings.appAUEffectChains[identifier, default: []]
+                .filter(\.isConsole1TrackEligible).count == 1
+        }
+        let ordered = eligible.sorted { lhs, rhs in
+            let lhsSlot = settings.appMixerStripSlots[lhs] ?? Int.max
+            let rhsSlot = settings.appMixerStripSlots[rhs] ?? Int.max
+            if lhsSlot != rhsSlot { return lhsSlot < rhsSlot }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+        settings.appMixerStripSlots = Dictionary(
+            uniqueKeysWithValues: ordered.enumerated().map { ($0.element, $0.offset + 1) }
+        )
     }
 
     // MARK: - Ignored Apps
@@ -473,6 +646,7 @@ final class SettingsManager {
         // Hiding is mutually exclusive with pinning
         settings.pinnedApps.remove(identifier)
         settings.pinnedAppInfo.removeValue(forKey: identifier)
+        removeMixerStripSlot(for: identifier)
         // Clear per-app settings — FineTune won't interact with this app
         settings.appVolumes.removeValue(forKey: identifier)
         settings.appBoosts.removeValue(forKey: identifier)
@@ -480,6 +654,7 @@ final class SettingsManager {
         settings.appDeviceRouting.removeValue(forKey: identifier)
         settings.appEQSettings.removeValue(forKey: identifier)
         settings.appAUEffectChains.removeValue(forKey: identifier)
+        settings.appAUBypassed.removeValue(forKey: identifier)
         settings.appDeviceSelectionMode.removeValue(forKey: identifier)
         settings.appSelectedDeviceUIDs.removeValue(forKey: identifier)
         scheduleSave()
@@ -931,37 +1106,44 @@ final class SettingsManager {
     }
 
     func updateAppSettings(_ newSettings: AppSettings) {
+        var committedSettings = newSettings
         // Handle launch at login separately via ServiceManagement
         if newSettings.launchAtLogin != settings.appSettings.launchAtLogin {
-            setLaunchAtLogin(newSettings.launchAtLogin)
+            if !setLaunchAtLogin(newSettings.launchAtLogin) {
+                committedSettings.launchAtLogin = launchAtLoginService?.isEnabled
+                    ?? settings.appSettings.launchAtLogin
+            }
         }
-        settings.appSettings = newSettings
+        settings.appSettings = committedSettings
         scheduleSave()
     }
 
-    private func setLaunchAtLogin(_ enabled: Bool) {
+    @discardableResult
+    private func setLaunchAtLogin(_ enabled: Bool) -> Bool {
+        guard let launchAtLoginService else { return true }
         do {
-            if enabled {
-                try SMAppService.mainApp.register()
-                logger.info("Registered for launch at login")
-            } else {
-                try SMAppService.mainApp.unregister()
-                logger.info("Unregistered from launch at login")
-            }
+            try launchAtLoginService.setEnabled(enabled)
+            logger.info("Updated launch at login: \(enabled)")
+            return true
         } catch {
             logger.error("Failed to set launch at login: \(error.localizedDescription)")
+            return false
         }
     }
 
     /// Returns the actual launch at login status from the system
     var isLaunchAtLoginEnabled: Bool {
-        SMAppService.mainApp.status == .enabled
+        launchAtLoginService?.isEnabled ?? settings.appSettings.launchAtLogin
     }
 
     // MARK: - Reset All Settings
 
     /// Resets all per-app settings and app-wide settings to defaults
     func resetAllSettings() {
+        // ServiceManagement can reject unregistering a login item. Resolve that external
+        // state before replacing AppSettings so a failure can be reflected in both the UI
+        // and the settings file instead of reporting a reset that did not happen.
+        let launchAtLoginResetSucceeded = setLaunchAtLogin(false)
         settings.appVolumes.removeAll()
         settings.appBoosts.removeAll()
         settings.appDeviceRouting.removeAll()
@@ -975,9 +1157,15 @@ final class SettingsManager {
         settings.deviceAUBypassed.removeAll()
         settings.pinnedApps.removeAll()
         settings.pinnedAppInfo.removeAll()
+        settings.appMixerStripSlots.removeAll()
         settings.ignoredApps.removeAll()
         settings.ignoredAppInfo.removeAll()
-        settings.appSettings = AppSettings()
+        var defaultAppSettings = AppSettings()
+        if !launchAtLoginResetSucceeded {
+            defaultAppSettings.launchAtLogin = launchAtLoginService?.isEnabled
+                ?? settings.appSettings.launchAtLogin
+        }
+        settings.appSettings = defaultAppSettings
         settings.systemSoundsFollowsDefault = true
         settings.lockedInputDeviceUID = nil
         settings.preferredInputDeviceUID = nil
@@ -999,9 +1187,6 @@ final class SettingsManager {
         settings.appDeviceSelectionMode.removeAll()
         settings.appSelectedDeviceUIDs.removeAll()
         settings.userEQPresets.removeAll()
-
-        // Also unregister from launch at login
-        try? SMAppService.mainApp.unregister()
 
         scheduleSave()
         logger.info("Reset all settings to defaults")
@@ -1027,14 +1212,14 @@ final class SettingsManager {
 
     private func scheduleSave() {
         saveTask?.cancel()
-        saveTask = Task {
+        saveTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled else { return }
             let snapshot = settings
             let url = settingsURL
             let data = try? JSONEncoder().encode(snapshot)
             guard let data else { return }
-            Task.detached(priority: .utility) {
+            saveQueue.async {
                 do {
                     try Self.writeData(data, to: url)
                 } catch {
@@ -1047,20 +1232,28 @@ final class SettingsManager {
 
     /// Immediately writes pending changes to disk.
     /// Call this on app termination to prevent data loss.
-    func flushSync() {
+    @discardableResult
+    func flushSync() -> Bool {
         saveTask?.cancel()
         saveTask = nil
-        writeToDisk()
+        return writeToDisk()
     }
 
-    private func writeToDisk() {
+    @discardableResult
+    private func writeToDisk() -> Bool {
         do {
             let data = try JSONEncoder().encode(settings)
-            try Self.writeData(data, to: settingsURL)
+            let url = settingsURL
+            // FIFO ordering guarantees all older debounce snapshots finish first.
+            try saveQueue.sync {
+                try Self.writeData(data, to: url)
+            }
 
             logger.debug("Saved settings")
+            return true
         } catch {
             logger.error("Failed to save settings: \(error.localizedDescription)")
+            return false
         }
     }
 

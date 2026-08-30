@@ -10,7 +10,9 @@ extension AppearancePreference {
     var swiftUIColorScheme: ColorScheme? {
         switch self {
         case .system:
-            let match = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+            let match = NSApplication.shared.effectiveAppearance.bestMatch(
+                from: [.darkAqua, .aqua]
+            )
             return match == .darkAqua ? .dark : .light
         case .light: return .light
         case .dark: return .dark
