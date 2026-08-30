@@ -72,11 +72,12 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 
 ### 🎛 EQ & Correction
 - **10-band EQ** — 20 presets across 5 categories
+- **Safe per-app default** — The built-in EQ starts flat and off for every app that has no saved EQ choice; an existing explicit on/off choice is preserved
 - **User EQ presets** — Save, rename, and manage custom EQ configurations per app
 - **Audio Unit effects** — Load AU effects on an app or output device, manage presets, bypass chains, and open custom or generic plugin interfaces
   - In mirrored multi-output mode, the first selected output in Settings device-priority order is marked **Primary**; its device chain processes the shared stream before fan-out, while secondary-device chains remain stored and take effect when that device becomes primary
   - Console 1 is intentionally available only on persistent per-app strips, preventing transient per-device hosts from consuming extra Console tracks
-- **Persistent Console 1 tracks** — Pin an app, add one Softube Console 1 to its app effect chain, and choose its Console startup order. FineTune keeps that AU instance alive across process/tap/output changes and ordinary bypasses so the Console track remains bound to the app. Crash-quarantined plugins do not reserve a slot. Ordering applies after restarting FineTune; Console 1 still chooses the lowest track free across all hosts
+- **Persistent Console 1 tracks** — Pin an app, add one Softube Console 1 to its app effect chain, and choose its Console startup order. FineTune keeps that AU instance alive across process/tap/output changes and ordinary bypasses so the Console track remains bound to the app. Crash-quarantined plugins do not reserve a slot. Ordering applies after restarting FineTune; Console 1 still chooses the lowest track free across all hosts. See the [Console 1 guide](guide/console1.md) for setup, lifecycle, and recovery details
 - **AutoEQ headphone correction** — Search thousands of headphone profiles or import your own ParametricEQ.txt files for per-device frequency response correction
 - **Loudness compensation** — Automatic bass and treble correction at low volumes using ISO 226:2023 equal-loudness contours, with real-time level management to keep perceived loudness consistent
 
@@ -99,6 +100,7 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 
 ## Documentation
 
+- **[Persistent Console 1 Tracks](guide/console1.md)** — Bind pinned apps to stable Console 1 strips, control startup order, and recover an unexpected track assignment
 - **[AutoEQ & Headphone Correction](guide/autoeq.md)** — Apply frequency correction from the [AutoEQ](https://github.com/jaakkopasanen/AutoEq) project, import [EqualizerAPO](https://sourceforge.net/projects/equalizerapo/) profiles, or browse [autoeq.app](https://www.autoeq.app/)
 - **[URL Schemes](guide/url-schemes.md)** — Automate FineTune from Terminal, [Shortcuts](https://support.apple.com/guide/shortcuts-mac), [Raycast](https://raycast.com), or scripts
 - **[Troubleshooting](guide/troubleshooting.md)** — Permission issues, missing apps, audio problems

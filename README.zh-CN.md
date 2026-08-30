@@ -74,11 +74,12 @@ brew install --cask finetune
 
 ### 🎛 EQ 与校正
 - **10 段均衡器** —— 内置 5 大类、共 20 个预设
+- **安全的 App 默认值** —— 没有已保存 EQ 选择的 App 会以平直曲线且关闭的状态启动；已有的显式开关选择会保留
 - **自定义 EQ 预设** —— 可按 App 保存、重命名和管理你自己的 EQ 配置
 - **Audio Unit 效果器** —— 可在 App 或输出设备上加载 AU 效果器、管理预设与旁通，并打开插件的自定义或通用界面
   - 镜像多输出模式下，会按“设置”里的设备优先级把第一个已选输出标为**主设备**；它的设备效果链会在分流前处理共享音频，其他设备的效果链仍会保存，并在该设备成为主输出时生效
   - Console 1 仅可加入持久化的 App strip，避免临时设备宿主额外占用 Console 轨道
-- **固定 Console 1 轨道** —— 置顶 App、在该 App 的效果链中加入一枚 Softube Console 1，再选择 Console 启动顺序。FineTune 会让同一个 AU 实例跨进程、音频 tap、输出设备切换和普通旁路持续存活，使 Console 轨道始终绑定到该 App；崩溃隔离的插件不占启动位置。排序在重启 FineTune 后生效，实际编号仍由 Console 1 在所有宿主中选择当时最低的空闲轨道
+- **固定 Console 1 轨道** —— 置顶 App、在该 App 的效果链中加入一枚 Softube Console 1，再选择 Console 启动顺序。FineTune 会让同一个 AU 实例跨进程、音频 tap、输出设备切换和普通旁路持续存活，使 Console 轨道始终绑定到该 App；崩溃隔离的插件不占启动位置。排序在重启 FineTune 后生效，实际编号仍由 Console 1 在所有宿主中选择当时最低的空闲轨道。设置步骤、生命周期和恢复方法详见 [Console 1 指南](guide/console1.zh-CN.md)
 - **AutoEQ 耳机校正** —— 在数千条耳机曲线中搜索，或直接导入自己的 ParametricEQ.txt 文件，为每台设备进行频响校正
 - **响度补偿** —— 在低音量下，依据 ISO 226:2023 等响度曲线自动补偿低频和高频，并实时管理整体电平，让感知响度保持一致
 
@@ -101,6 +102,7 @@ brew install --cask finetune
 
 ## 文档
 
+- **[固定 Console 1 轨道](guide/console1.zh-CN.md)** —— 将置顶 App 绑定到稳定的 Console 1 strip、设置启动顺序，并恢复意外的轨道分配
 - **[AutoEQ 与耳机校正](guide/autoeq.zh-CN.md)** —— 应用来自 [AutoEQ](https://github.com/jaakkopasanen/AutoEq) 项目的频响校正、导入 [EqualizerAPO](https://sourceforge.net/projects/equalizerapo/) 配置，或浏览 [autoeq.app](https://www.autoeq.app/)
 - **[URL Scheme](guide/url-schemes.md)** —— 通过终端、[快捷指令](https://support.apple.com/guide/shortcuts-mac)、[Raycast](https://raycast.com) 或脚本自动化 FineTune
 - **[排查指引](guide/troubleshooting.md)** —— 权限问题、应用未出现、声音异常等
