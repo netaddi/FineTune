@@ -99,6 +99,8 @@ private func processWithDefaults(
     targetVol: Float = 1.0,
     crossfadeMultiplier: Float = 1.0,
     outputGateMultiplier: Float = 1.0,
+    outputGateStartMultiplier: Float? = nil,
+    outputGateRampFrameCount: Int = 0,
     rampCoefficient: Float = 1.0,
     preferredStereoLeft: Int = 0,
     preferredStereoRight: Int = 1,
@@ -114,6 +116,8 @@ private func processWithDefaults(
         targetVol: targetVol,
         crossfadeMultiplier: crossfadeMultiplier,
         outputGateMultiplier: outputGateMultiplier,
+        outputGateStartMultiplier: outputGateStartMultiplier,
+        outputGateRampFrameCount: outputGateRampFrameCount,
         rampCoefficient: rampCoefficient,
         inputStereoLeft: preferredStereoLeft,
         inputStereoRight: preferredStereoRight,
@@ -127,6 +131,37 @@ private func processWithDefaults(
         loudnessEqualizerProc: loudnessEqualizerProc,
         loudnessCompensatorProc: loudnessCompensatorProc
     )
+}
+
+@Suite("ProcessTapController — Output Gate Envelope Rendering")
+struct OutputGateEnvelopeRenderingTests {
+    @Test("The processing loop applies a per-frame ramp instead of one gain per buffer")
+    func outputGateRampsInsideBuffer() {
+        let frames = 64
+        let input = TestABL(buffers: [(channels: 2, frames: frames)])
+        let output = TestABL(buffers: [(channels: 2, frames: frames)])
+        fill(input, bufferIndex: 0, value: 0.5)
+
+        var volume: Float = 1
+        processWithDefaults(
+            input: input,
+            output: output,
+            outputGateMultiplier: 1,
+            outputGateStartMultiplier: 0,
+            outputGateRampFrameCount: frames,
+            currentVol: &volume
+        )
+
+        let samples = output.data(at: 0)
+        #expect(samples[0] == 0)
+        #expect(samples[2] > samples[0])
+        #expect(samples[(frames - 1) * 2] > samples[2])
+        #expect(samples[(frames - 1) * 2] < 0.5)
+        for frame in 1..<frames {
+            #expect(samples[frame * 2] >= samples[(frame - 1) * 2])
+            #expect(samples[frame * 2 + 1] >= samples[(frame - 1) * 2 + 1])
+        }
+    }
 }
 
 private func repositoryRootURL() -> URL {

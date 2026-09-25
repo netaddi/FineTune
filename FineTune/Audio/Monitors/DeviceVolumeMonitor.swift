@@ -187,9 +187,32 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     func outputProcessingGain(for deviceID: AudioDeviceID) -> Float {
-        guard outputVolumeBackend(for: deviceID) == .software else { return 1.0 }
-        if muteStates[deviceID] ?? false { return 0.0 }
-        return volumes[deviceID] ?? 1.0
+        let backend = outputVolumeBackend(for: deviceID)
+        let uid = outputDeviceUID(for: deviceID)
+        if backend == .ddc {
+            // DDC writes may fail or be cancelled by a re-probe. Keep digital silence
+            // for the entire mute intent, including a software → DDC handoff.
+            let muted = muteStates[deviceID]
+                ?? uid.map { settingsManager.getDDCMuteState(for: $0) }
+                ?? false
+            return Self.processingGain(backend: backend, volume: 1, muted: muted)
+        }
+        guard backend == .software else { return 1.0 }
+        let muted = muteStates[deviceID]
+            ?? uid.map { settingsManager.getSoftwareDeviceMuteState(for: $0) }
+            ?? false
+        let volume = volumes[deviceID]
+            ?? uid.flatMap { settingsManager.getSoftwareDeviceVolume(for: $0) }
+            ?? 1.0
+        return Self.processingGain(backend: backend, volume: volume, muted: muted)
+    }
+
+    nonisolated static func processingGain(backend: VolumeControlTier, volume: Float, muted: Bool) -> Float {
+        switch backend {
+        case .software: return muted ? 0 : volume
+        case .ddc: return muted ? 0 : 1
+        case .hardware: return 1
+        }
     }
 
     func refreshOutputDeviceStates() {
@@ -445,6 +468,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
                     ddcController.unmute(for: deviceID)
                 }
                 muteStates[deviceID] = muted
+                publishOutputState(for: deviceID)
             } else {
                 logger.warning("Failed to set DDC mute on device \(deviceID)")
             }
@@ -781,6 +805,12 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
         // Read volumes and mute states for all current devices
         readAllStates()
+        // Device-list and volume-monitor observations run in separate main-actor turns.
+        // Publish the freshly loaded software state so AudioEngine can provision a
+        // connected-idle client before it submits audio on the new device.
+        for deviceID in newVolumeIDs.union(newMuteIDs) {
+            publishOutputState(for: deviceID)
+        }
     }
 
     private func addVolumeListener(for deviceID: AudioDeviceID) {
@@ -936,7 +966,10 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
     private func handleMuteChanged(for deviceID: AudioDeviceID) {
         guard deviceID.isValid else { return }
-        if outputVolumeBackend(for: deviceID) == .software { return }
+        // HAL is not the mute authority for software or DDC outputs. A display driver
+        // commonly reports false here even while a DDC mute is pending or in force.
+        // Accepting that notification would release the digital silence prematurely.
+        guard outputVolumeBackend(for: deviceID) == .hardware else { return }
         let newMuteState = deviceID.readMuteState()
         muteStates[deviceID] = newMuteState
         onMuteChanged?(deviceID, newMuteState)
@@ -1031,6 +1064,19 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
             }
         }
         readOneState(for: deviceID, device: device)
+        // A tier transition is itself a processing-eligibility change. Merely updating
+        // these caches leaves connected-idle clients without a software-gain tap until
+        // some unrelated HAL event, reopening the first-buffer unity-gain window.
+        publishOutputState(for: deviceID)
+    }
+
+    private func publishOutputState(for deviceID: AudioDeviceID) {
+        if let volume = volumes[deviceID] {
+            onVolumeChanged?(deviceID, volume)
+        }
+        if let muted = muteStates[deviceID] {
+            onMuteChanged?(deviceID, muted)
+        }
     }
 
     private func outputDeviceUID(for deviceID: AudioDeviceID) -> String? {

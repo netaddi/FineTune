@@ -13,6 +13,12 @@ struct DeviceAUEffectTransition: Sendable {
 @MainActor
 protocol ProcessTapControlling: AnyObject, Sendable {
     var app: AudioApp { get }
+    /// macOS 26 taps can retain bundle identities while the process is absent and attach
+    /// to the replacement process before its first output buffer.
+    var restoresProcessByBundleID: Bool { get }
+    /// Immutable bundle set installed in the Core Audio tap description. Metadata learned
+    /// after activation must be compared against this set before reusing a standby graph.
+    var configuredRestorationBundleIDs: Set<String> { get }
     var volume: Float { get set }
     var isMuted: Bool { get set }
     var currentDeviceVolume: Float { get set }
@@ -22,6 +28,7 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     var currentDeviceUIDs: [String] { get }
 
     func activate(initial: TapInitialState) throws
+    func rebind(to app: AudioApp)
     func invalidate()
     /// Blocking teardown used only when another producer will immediately inherit the
     /// same persistent stateful AU instances.
@@ -54,6 +61,11 @@ protocol ProcessTapControlling: AnyObject, Sendable {
 }
 
 extension ProcessTapControlling {
+    var restoresProcessByBundleID: Bool { false }
+    var configuredRestorationBundleIDs: Set<String> { [] }
+
+    func rebind(to app: AudioApp) {}
+
     /// Convenience activation with default state. Production callers must pass an
     /// `initial:` populated from persisted settings — defaults leave the first audio
     /// callbacks running with no EQ/AutoEQ/Loudness and unity volume ramp.

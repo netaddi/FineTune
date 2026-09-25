@@ -55,7 +55,7 @@ brew install --cask finetune
 ### 🎚 音量控制
 - **按 App 控制音量** —— 为每个应用提供独立的音量滑块和静音
 - **按 App 增益** —— 提供 2x / 3x / 4x 三档增益预设
-- **置顶 App** —— 即使应用没有在播放声音，也让它一直显示在菜单栏中，方便提前配置音量、EQ 和路由
+- **置顶 App 与暂停恢复保护** —— 无声时也可提前配置音量、EQ 和路由。音频客户端仍连接时，长时间暂停会保留处理链；回调中断后恢复时重新装入当前增益，并逐采样渐入 40 ms。在 macOS 26 及以上版本，已置顶 App 完全退出后也会保留按 bundle 恢复的预备图，激活前装好增益、静音、路由与 AU。支持 App 专用 helper；共享或身份未解析的 helper 仍需显式捕获。请先运行 FineTune 再播放，系统版本与生命周期限制见[启动/恢复排错说明](guide/troubleshooting.md#brief-loud-burst-when-an-app-starts-or-resumes-after-a-long-pause)
 - **忽略 App** —— 让 FineTune 完全脱离指定的应用，撤掉对应的音频接入点，让该应用回到 macOS 默认的音频通路
 - **滚轮调节音量** —— 把鼠标悬停到弹窗、HUD 或 EQ 面板的任一滑块上，滚动滚轮即可调节
 

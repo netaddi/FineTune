@@ -42,6 +42,14 @@ final class AudioEngine {
 
     /// Factory for creating tap controllers. Overridable for testing.
     private let tapFactory: @MainActor (AudioApp, [String], String?) throws -> any ProcessTapControlling
+    /// Bundle-only standby taps require macOS 26 process restoration. Production enables
+    /// them by default; injected test factories opt in explicitly so existing fixtures do
+    /// not gain hidden taps.
+    private let coldStartPrearmingEnabled: Bool
+    /// Explicit test factories can simulate the macOS 26 restoration contract on older
+    /// CI runners; production always derives this from the real OS availability.
+    private let bundleProcessRestorationAvailable: Bool
+    private var nextStandbyPID: pid_t = -1
 
     /// Closure to check if a device is alive. Overridable for testing.
     private let isAliveCheck: (AudioDeviceID) -> Bool
@@ -63,6 +71,21 @@ final class AudioEngine {
     /// (< 1s apart) from deliberate user changes (> 1s after last override).
     private var lastAutoSwitchOverrideTime: Date?
     private var pendingCleanup: [pid_t: Task<Void, Never>] = [:]  // Grace period for stale tap cleanup
+    private var routeRetryTasks: [String: Task<Void, Never>] = [:]
+    private var routeRetryAttempts: [String: Int] = [:]
+    /// Monotonic desired-route revision per logical app. Async HAL switches may complete
+    /// out of order, so only a completion for the current revision may publish metadata.
+    private var routeIntentRevisions: [String: UInt64] = [:]
+    private struct RouteIntentPlan: Equatable {
+        let uids: [String]
+        let followsDefault: Bool
+    }
+    /// Snapshot paired with the latest revision. In particular, a programmatic default
+    /// write reaches HAL before DeviceVolumeMonitor's listener updates its cached UID.
+    private var routeIntentPlans: [String: RouteIntentPlan] = [:]
+    private var routeReconcileTasks: [String: Task<Void, Never>] = [:]
+    private var coldStartRetryTasks: [String: Task<Void, Never>] = [:]
+    private var coldStartRetryAttempts: [String: Int] = [:]
     private var staleCleanupTask: Task<Void, Never>?  // Debounced cleanup scheduling
     private var healthMonitorTask: Task<Void, Never>?  // Periodic tap health monitor
     private var tapRecoveryCooldownUntil: [pid_t: Date] = [:]  // Prevents tap recreation thrashing
@@ -196,6 +219,7 @@ final class AudioEngine {
         processMonitor: (any AudioProcessMonitoring)? = nil,
         deviceVolumeMonitor: (any DeviceVolumeProviding)? = nil,
         tapFactory: (@MainActor (AudioApp, [String], String?) throws -> any ProcessTapControlling)? = nil,
+        enableColdStartPrearming: Bool? = nil,
         isAlive: ((AudioDeviceID) -> Bool)? = nil,
         startMonitorsAutomatically: Bool = true
     ) {
@@ -220,6 +244,14 @@ final class AudioEngine {
         }
         self.processMonitor = processMonitor ?? AudioProcessMonitor()
         self.bluetoothDeviceMonitor = BluetoothDeviceMonitor()
+        self.coldStartPrearmingEnabled = enableColdStartPrearming ?? (tapFactory == nil)
+        if let enableColdStartPrearming {
+            self.bundleProcessRestorationAvailable = enableColdStartPrearming
+        } else if #available(macOS 26.0, *) {
+            self.bundleProcessRestorationAvailable = true
+        } else {
+            self.bundleProcessRestorationAvailable = false
+        }
 
         #if !APP_STORE
         let ddc = DDCController(settingsManager: manager)
@@ -277,6 +309,19 @@ final class AudioEngine {
         // Wire callbacks — needed for both test and production mode
         wireCallbacks()
 
+        #if !APP_STORE
+        // DDC availability can change after display re-probes, independently of HAL's
+        // device list. Wire this outside automatic monitor startup so the transition is
+        // deterministic and directly testable with an injected volume provider.
+        ddc.onProbeCompleted = { [weak self] in
+            guard let self else { return }
+            self.deviceVolumeMonitor.refreshAfterDDCProbe()
+            self.refreshAllTapOutputStates()
+            self.applyPersistedSettings()
+            self.preparePinnedColdStartTaps()
+        }
+        #endif
+
         if startMonitorsAutomatically {
             Task { @MainActor in
                 if self.permission.status == .authorized {
@@ -286,10 +331,6 @@ final class AudioEngine {
                 self.bluetoothDeviceMonitor.start()
 
                 #if !APP_STORE
-                ddc.onProbeCompleted = { [weak self] in
-                    self?.deviceVolumeMonitor.refreshAfterDDCProbe()
-                    self?.refreshAllTapOutputStates()
-                }
                 ddc.start()
                 #endif
 
@@ -297,6 +338,7 @@ final class AudioEngine {
                 self.deviceVolumeMonitor.start()
 
                 self.applyPersistedSettings()
+                self.preparePinnedColdStartTaps()
                 self.registerNewDevicesInPriority()
                 // Seed the confirmed default from whatever macOS has at startup
                 self.lastConfirmedDefaultUID = self.deviceVolumeMonitor.defaultDeviceUID
@@ -321,6 +363,7 @@ final class AudioEngine {
                 if self.permission.status == .authorized {
                     self.processMonitor.start()
                     self.applyPersistedSettings()
+                    self.preparePinnedColdStartTaps()
                     self.startHealthMonitor()
                     self.logger.info("Audio capture authorized — process monitor started")
                 } else {
@@ -340,8 +383,10 @@ final class AudioEngine {
             for (_, tap) in self.taps {
                 if tap.currentDeviceUID == deviceUID {
                     tap.currentDeviceVolume = newVolume
-                    if tap.currentDeviceUIDs.count == 1,
-                       self.outputVolumeBackend(for: deviceID) == .software {
+                    if tap.currentDeviceUIDs.count == 1 {
+                        // Recompute across every backend transition. For hardware/DDC,
+                        // effectiveVolume deliberately omits device gain, which also
+                        // clears any software attenuation left on an existing tap.
                         tap.volume = self.effectiveVolume(for: tap.app.id, deviceUIDs: tap.currentDeviceUIDs)
                     }
                     tap.updateLoudnessCompensation(
@@ -349,6 +394,10 @@ final class AudioEngine {
                         enabled: loudnessEnabled
                     )
                 }
+            }
+            if self.outputVolumeBackend(for: deviceID) == .software
+                || self.deviceVolumeMonitor.outputProcessingGain(for: deviceID) != 1 {
+                self.applyPersistedSettings()
             }
         }
 
@@ -358,16 +407,20 @@ final class AudioEngine {
             for (_, tap) in self.taps {
                 if tap.currentDeviceUID == deviceUID {
                     tap.isDeviceMuted = isMuted
-                    if tap.currentDeviceUIDs.count == 1,
-                       self.outputVolumeBackend(for: deviceID) == .software {
+                    if tap.currentDeviceUIDs.count == 1 {
                         tap.volume = self.effectiveVolume(for: tap.app.id, deviceUIDs: tap.currentDeviceUIDs)
                     }
                 }
+            }
+            if self.outputVolumeBackend(for: deviceID) == .software
+                || self.deviceVolumeMonitor.outputProcessingGain(for: deviceID) != 1 {
+                self.applyPersistedSettings()
             }
         }
 
         processMonitor.onAppsChanged = { [weak self] apps in
             self?.applyPersistedSettings()
+            self?.preparePinnedColdStartTaps()
             self?.scheduleStaleCleanup()
         }
 
@@ -392,8 +445,14 @@ final class AudioEngine {
         }
 
         deviceMonitor.onDeviceConnected = { [weak self] deviceUID, deviceName in
-            self?.handleDeviceConnected(deviceUID, name: deviceName)
-            self?.bluetoothDeviceMonitor.notifyDeviceAppearedInCoreAudio()
+            guard let self else { return }
+            // The device is already visible in AudioDeviceMonitor here. Re-evaluate
+            // connected-idle clients before routing transitions so explicit/multi-device
+            // processing can be armed without waiting for their first running callback.
+            self.applyPersistedSettings()
+            self.handleDeviceConnected(deviceUID, name: deviceName)
+            self.preparePinnedColdStartTaps()
+            self.bluetoothDeviceMonitor.notifyDeviceAppearedInCoreAudio()
         }
 
         deviceMonitor.onInputDeviceDisconnected = { [weak self] deviceUID, deviceName in
@@ -408,7 +467,13 @@ final class AudioEngine {
         }
 
         deviceVolumeMonitor.onDefaultDeviceChanged = { [weak self] newDefaultUID in
-            self?.handleDefaultDeviceChanged(newDefaultUID)
+            guard let self else { return }
+            // Only provision against a default that the priority state machine accepted.
+            // Rejected BT auto-switches are followed by our own HAL echo, which performs
+            // this reconciliation against the restored target instead.
+            guard self.handleDefaultDeviceChanged(newDefaultUID) else { return }
+            self.applyPersistedSettings()
+            self.preparePinnedColdStartTaps()
         }
 
         deviceVolumeMonitor.onDefaultInputDeviceChanged = { [weak self] newDefaultInputUID in
@@ -420,6 +485,79 @@ final class AudioEngine {
 
     var apps: [AudioApp] {
         processMonitor.activeApps
+    }
+
+    /// Apps whose tap lifecycle must be considered even while their IO is stopped. The
+    /// production process monitor keeps these connected clients separate from the active
+    /// list so the UI remains uncluttered while saved gain can be armed early.
+    private var appsForTapProvisioning: [AudioApp] {
+        let activePIDs = Set(processMonitor.activeApps.map(\.id))
+        let pinnedInfo = Dictionary(
+            uniqueKeysWithValues: settingsManager.getPinnedAppInfo().map {
+                ($0.persistenceIdentifier, $0)
+            }
+        )
+        return processMonitor.connectedApps.filter { app in
+            activePIDs.contains(app.id)
+                || shouldProvisionIdleTap(for: app.persistenceIdentifier)
+        }.map { app in
+            app.includingRestorationBundleIDs(
+                pinnedInfo[app.persistenceIdentifier]?.restorationBundleIDs ?? []
+            )
+        }
+    }
+
+    private func appWithPersistedRestorationIdentity(_ app: AudioApp) -> AudioApp {
+        let learned = settingsManager.getPinnedAppInfo().first {
+            $0.persistenceIdentifier == app.persistenceIdentifier
+        }?.restorationBundleIDs ?? []
+        return app.includingRestorationBundleIDs(learned)
+    }
+
+    private func shouldProvisionIdleTap(for identifier: String) -> Bool {
+        guard !settingsManager.isIgnored(identifier) else { return false }
+        if shouldRetainRestoringTapWhileAbsent(for: identifier) { return true }
+        if settingsManager.appSettings.defaultNewAppVolume != 1 { return true }
+        if settingsManager.appSettings.loudnessCompensationEnabled
+            || settingsManager.appSettings.loudnessEqualizationEnabled {
+            return true
+        }
+
+        // Device processing is also part of the first-buffer contract. This only keeps
+        // currently connected clients warm; it does not retain every historical app.
+        guard let plan = inactiveDevicePlan(for: identifier) else { return false }
+        return plan.uids.contains { uid in
+            if !settingsManager.getDeviceAUEffectChain(for: uid).isEmpty { return true }
+            if settingsManager.getAutoEQSelection(for: uid)?.isEnabled == true { return true }
+            guard let device = deviceMonitor.device(for: uid) else { return false }
+            let gain = deviceVolumeMonitor.outputProcessingGain(for: device.id)
+            if abs(gain - 1) > 0.000_001 { return true }
+            guard outputVolumeBackend(for: device.id) == .software else { return false }
+            return deviceVolumeMonitor.muteStates[device.id] == true
+                || settingsManager.getSoftwareDeviceMuteState(for: uid)
+                || abs((settingsManager.getSoftwareDeviceVolume(for: uid) ?? 1) - 1) > 0.000_001
+        }
+    }
+
+    /// Global defaults justify provisioning a client that is currently connected, but
+    /// must not retain every app ever seen as a permanent aggregate/IOProc. Only explicit
+    /// per-app state keeps a restoring graph alive after the process disappears.
+    private func shouldRetainRestoringTapWhileAbsent(for identifier: String) -> Bool {
+        guard !settingsManager.isIgnored(identifier) else { return false }
+        if settingsManager.isPinned(identifier) { return true }
+        if let volume = settingsManager.getVolume(for: identifier),
+           abs(volume - settingsManager.appSettings.defaultNewAppVolume) > 0.000_001 {
+            return true
+        }
+        if settingsManager.getBoost(for: identifier)?.isBoosted == true { return true }
+        if settingsManager.getMute(for: identifier) == true { return true }
+        if settingsManager.getEQSettings(for: identifier).isEnabled { return true }
+        if settingsManager.getDeviceRouting(for: identifier) != nil { return true }
+        if settingsManager.getDeviceSelectionMode(for: identifier) == .multi,
+           !(settingsManager.getSelectedDeviceUIDs(for: identifier) ?? []).isEmpty {
+            return true
+        }
+        return !settingsManager.getAUEffectChain(for: identifier).isEmpty
     }
 
     // MARK: - Displayable Apps (Active + Pinned Inactive)
@@ -466,12 +604,15 @@ final class AudioEngine {
             identifier: app.persistenceIdentifier,
             displayName: app.name
         )
+        preparePinnedColdStartTaps()
     }
 
     /// Unpin an app by its persistence identifier.
     func unpinApp(_ identifier: String) {
+        clearColdStartRetry(for: identifier)
         appListCoordinator.unpinApp(identifier)
         refreshPersistentMixerStripSlots()
+        retireUnneededRestoringTaps(for: identifier)
     }
 
     /// Check if an app is pinned.
@@ -523,6 +664,7 @@ final class AudioEngine {
     /// Identifier-based path shared by active and pinned-inactive rows. Every PID that
     /// belongs to the logical app is retired before the persistent Console strip is released.
     func ignoreApp(identifier: String, displayName: String, bundleID: String?) {
+        clearColdStartRetry(for: identifier)
         for entry in getAUEffectChain(forIdentifier: identifier) {
             AUPluginWindowManager.shared.closeWindow(for: entry.id)
         }
@@ -571,6 +713,18 @@ final class AudioEngine {
 
     func setVolumeForInactive(identifier: String, to volume: Float) {
         appListCoordinator.setVolumeForInactive(identifier: identifier, to: volume)
+        if let (pid, tap) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) {
+            volumeState.setVolume(for: pid, to: volume, identifier: identifier)
+            tap.volume = effectiveVolume(for: pid, deviceUIDs: tap.currentDeviceUIDs)
+            if settingsManager.appSettings.loudnessCompensationEnabled {
+                tap.updateLoudnessCompensation(
+                    volume: effectiveLoudnessVolume(for: tap),
+                    enabled: true
+                )
+            }
+        }
     }
 
     func getBoostForInactive(identifier: String) -> BoostLevel {
@@ -579,6 +733,12 @@ final class AudioEngine {
 
     func setBoostForInactive(identifier: String, to boost: BoostLevel) {
         appListCoordinator.setBoostForInactive(identifier: identifier, to: boost)
+        if let (pid, tap) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) {
+            volumeState.setBoost(for: pid, to: boost, identifier: identifier)
+            tap.volume = effectiveVolume(for: pid, deviceUIDs: tap.currentDeviceUIDs)
+        }
     }
 
     func getMuteForInactive(identifier: String) -> Bool {
@@ -587,6 +747,12 @@ final class AudioEngine {
 
     func setMuteForInactive(identifier: String, to muted: Bool) {
         appListCoordinator.setMuteForInactive(identifier: identifier, to: muted)
+        if let (pid, tap) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) {
+            volumeState.setMute(for: pid, to: muted, identifier: identifier)
+            tap.isMuted = muted
+        }
     }
 
     func getEQSettingsForInactive(identifier: String) -> EQSettings {
@@ -595,6 +761,9 @@ final class AudioEngine {
 
     func setEQSettingsForInactive(_ settings: EQSettings, identifier: String) {
         appListCoordinator.setEQSettingsForInactive(settings, identifier: identifier)
+        for tap in taps.values where tap.app.persistenceIdentifier == identifier {
+            tap.updateEQSettings(settings)
+        }
     }
 
     func getDeviceRoutingForInactive(identifier: String) -> String? {
@@ -616,6 +785,8 @@ final class AudioEngine {
 
     func setDeviceRoutingForInactive(identifier: String, deviceUID: String?) {
         appListCoordinator.setDeviceRoutingForInactive(identifier: identifier, deviceUID: deviceUID)
+        advanceRouteIntent(for: identifier)
+        refreshInactiveTapRouting(identifier: identifier)
     }
 
     func isFollowingDefaultForInactive(identifier: String) -> Bool {
@@ -628,6 +799,13 @@ final class AudioEngine {
 
     func setDeviceSelectionModeForInactive(identifier: String, to mode: DeviceSelectionMode) {
         appListCoordinator.setDeviceSelectionModeForInactive(identifier: identifier, to: mode)
+        if let (pid, _) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) {
+            volumeState.setDeviceSelectionMode(for: pid, to: mode, identifier: identifier)
+        }
+        advanceRouteIntent(for: identifier)
+        refreshInactiveTapRouting(identifier: identifier)
     }
 
     func getSelectedDeviceUIDsForInactive(identifier: String) -> Set<String> {
@@ -636,6 +814,13 @@ final class AudioEngine {
 
     func setSelectedDeviceUIDsForInactive(identifier: String, to uids: Set<String>) {
         appListCoordinator.setSelectedDeviceUIDsForInactive(identifier: identifier, to: uids)
+        if let (pid, _) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) {
+            volumeState.setSelectedDeviceUIDs(for: pid, to: uids, identifier: identifier)
+        }
+        advanceRouteIntent(for: identifier)
+        refreshInactiveTapRouting(identifier: identifier)
     }
 
     /// Audio levels for all active apps (for VU meter visualization)
@@ -660,6 +845,7 @@ final class AudioEngine {
         }
         deviceMonitor.start()
         applyPersistedSettings()
+        preparePinnedColdStartTaps()
         if permission.status == .authorized {
             startHealthMonitor()
         }
@@ -674,6 +860,16 @@ final class AudioEngine {
 
     func stop() {
         stopHealthMonitor()
+        for task in routeRetryTasks.values { task.cancel() }
+        routeRetryTasks.removeAll()
+        routeRetryAttempts.removeAll()
+        for task in routeReconcileTasks.values { task.cancel() }
+        routeReconcileTasks.removeAll()
+        routeIntentRevisions.removeAll()
+        routeIntentPlans.removeAll()
+        for task in coldStartRetryTasks.values { task.cancel() }
+        coldStartRetryTasks.removeAll()
+        coldStartRetryAttempts.removeAll()
         processMonitor.stop()
         deviceMonitor.stop()
         for tap in taps.values {
@@ -700,6 +896,9 @@ final class AudioEngine {
     /// buffer valid after the IOProcs have been joined.
     func prepareForProcessExit() {
         stopHealthMonitor()
+        for task in routeRetryTasks.values { task.cancel() }
+        for task in routeReconcileTasks.values { task.cancel() }
+        for task in coldStartRetryTasks.values { task.cancel() }
         processMonitor.stop()
         deviceMonitor.stop()
         for tap in taps.values {
@@ -727,6 +926,16 @@ final class AudioEngine {
 
         // 1. Clear persisted state
         settingsManager.resetAllSettings()
+        for task in routeRetryTasks.values { task.cancel() }
+        routeRetryTasks.removeAll()
+        routeRetryAttempts.removeAll()
+        for task in routeReconcileTasks.values { task.cancel() }
+        routeReconcileTasks.removeAll()
+        routeIntentRevisions.removeAll()
+        routeIntentPlans.removeAll()
+        for task in coldStartRetryTasks.values { task.cancel() }
+        coldStartRetryTasks.removeAll()
+        coldStartRetryAttempts.removeAll()
 
         // 2. Clear in-memory routing and tracking state
         appliedPIDs.removeAll()
@@ -755,6 +964,12 @@ final class AudioEngine {
         deviceAU.removeAll()
         favoriteAUPluginIDs.removeAll()
         auCrashHistory.removeAll()
+
+        // Bundle-restoring standby taps can outlive their process by design. Once reset
+        // removes the pin and every saved processing setting, keeping those graphs alive
+        // would leak HAL resources until another process-list event happened to run stale
+        // cleanup. Retire them immediately; connected/active taps remain available.
+        retireUnneededRestoringTaps()
 
         // 6. Re-apply from clean settings (re-establishes routing to system default)
         applyPersistedSettings()
@@ -795,18 +1010,17 @@ final class AudioEngine {
         volumeState.getBoost(for: app.id)
     }
 
-    /// Effective gain for ProcessTapController: app volume × boost, plus optional
-    /// single-device software output gain for software-backed devices.
-    /// Single-device-routed apps on `.software`-backed devices always receive the
-    /// device's software gain; multi-destination routing keeps `appGain` alone
-    /// because per-device software gain has no unambiguous meaning across fan-out.
+    /// Effective gain for ProcessTapController: app volume × boost, plus the monitor's
+    /// single-device processing gain. That gain is normally non-unity only for software
+    /// volume, or zero for the entire DDC mute intent so an asynchronous write cannot leak.
+    /// Multi-destination routing keeps `appGain` alone because a per-device gain has no
+    /// unambiguous meaning across fan-out.
     private func effectiveVolume(for pid: pid_t, deviceUIDs: [String]? = nil) -> Float {
         let appGain = volumeState.getVolume(for: pid) * volumeState.getBoost(for: pid).rawValue
 
         guard let resolvedUIDs = deviceUIDs, resolvedUIDs.count == 1,
               let primaryUID = resolvedUIDs.first,
-              let device = deviceMonitor.device(for: primaryUID),
-              outputVolumeBackend(for: device.id) == .software else {
+              let device = deviceMonitor.device(for: primaryUID) else {
             return appGain
         }
 
@@ -833,6 +1047,19 @@ final class AudioEngine {
             tap.currentDeviceVolume = 1.0
             tap.isDeviceMuted = false
         }
+    }
+
+    /// Actor suspension can overlap a standby→live PID adoption. Resolve the current
+    /// dictionary key by controller identity after every await instead of trusting a PID
+    /// captured before suspension. A controller that was replaced receives no late write.
+    @discardableResult
+    private func applyTapOutputStateIfRegistered(
+        to tap: any ProcessTapControlling,
+        deviceUIDs: [String]? = nil
+    ) -> Bool {
+        guard let pid = taps.first(where: { $0.value === tap })?.key else { return false }
+        applyTapOutputState(to: tap, for: pid, deviceUIDs: deviceUIDs)
+        return true
     }
 
     private func refreshAllTapOutputStates() {
@@ -975,15 +1202,19 @@ final class AudioEngine {
         }
     }
 
-    private func loadPersistedAUBypassState(for app: AudioApp, deviceUID: String) {
+    private func loadPersistedAUBypassState(
+        to tap: any ProcessTapControlling,
+        for app: AudioApp,
+        deviceUID: String
+    ) {
         let id = app.persistenceIdentifier
         if settingsManager.getAppAUBypassed(for: id) {
             persistentAppStrips[id]?.setBypassed(true)
-            taps[app.id]?.setAUChainBypassed(true)
+            tap.setAUChainBypassed(true)
             appAU[id, default: AUChainState()].isBypassed = true
         }
         if settingsManager.getDeviceAUBypassed(for: deviceUID) {
-            taps[app.id]?.setDeviceAUChainBypassed(true)
+            tap.setDeviceAUChainBypassed(true)
             deviceAU[deviceUID, default: AUChainState()].isBypassed = true
         }
     }
@@ -1400,6 +1631,9 @@ final class AudioEngine {
             }
         }
         syncDeviceAUFailedIDs(for: deviceUID)
+        // A connected client may be silent and therefore have no tap yet. Adding or
+        // enabling device processing must arm it now, before its next output buffer.
+        applyPersistedSettings()
     }
 
     func saveAllLiveAUState() {
@@ -1475,6 +1709,7 @@ final class AudioEngine {
             settingsManager.setAutoEQSelection(for: deviceUID, to: nil)
         }
         applyAutoEQToTaps(for: deviceUID)
+        applyPersistedSettings()
     }
 
     func setAutoEQEnabled(for deviceUID: String, enabled: Bool) {
@@ -1482,6 +1717,7 @@ final class AudioEngine {
         selection.isEnabled = enabled
         settingsManager.setAutoEQSelection(for: deviceUID, to: selection)
         applyAutoEQToTaps(for: deviceUID)
+        applyPersistedSettings()
     }
 
     func getAutoEQSelection(for deviceUID: String) -> AutoEQSelection? {
@@ -1503,6 +1739,7 @@ final class AudioEngine {
         for tap in taps.values {
             tap.updateLoudnessCompensation(volume: effectiveLoudnessVolume(for: tap), enabled: enabled)
         }
+        applyPersistedSettings()
     }
 
     func setLoudnessEqualizationEnabled(_ enabled: Bool) {
@@ -1511,6 +1748,13 @@ final class AudioEngine {
         for tap in taps.values {
             tap.updateLoudnessEqualization(settings)
         }
+        applyPersistedSettings()
+    }
+
+    /// The Settings view owns the persisted binding. This callback makes a newly
+    /// non-unity global default part of connected idle clients' first-buffer state.
+    func defaultNewAppVolumeDidChange() {
+        applyPersistedSettings()
     }
 
     /// Apply AutoEQ profile to all taps currently routed to the given device.
@@ -1541,10 +1785,437 @@ final class AudioEngine {
         )
     }
 
+    /// Reuses a still-running macOS 26 bundle-restoring graph for a replacement PID.
+    /// Core Audio has already attached the bundle before this metadata callback arrives;
+    /// re-keying here prevents AudioEngine from tearing that graph down and reopening the
+    /// exact first-buffer gap it was designed to close.
+    @discardableResult
+    private func adoptRestoringTap(for app: AudioApp) -> Bool {
+        guard taps[app.id] == nil,
+              let (oldPID, tap) = taps.first(where: {
+                  $0.value.restoresProcessByBundleID
+                      && $0.value.app.persistenceIdentifier == app.persistenceIdentifier
+              }) else { return false }
+
+        guard restoringTapCoversObservedProcesses(tap, for: app) else {
+            logger.info("Replacing pre-armed tap for \(app.name, privacy: .public): newly observed audio helper bundle")
+            return false
+        }
+
+        pendingCleanup.removeValue(forKey: oldPID)?.cancel()
+        taps.removeValue(forKey: oldPID)
+        let route = appDeviceRouting.removeValue(forKey: oldPID)
+        let followedDefault = followsDefault.remove(oldPID) != nil
+        appliedPIDs.remove(oldPID)
+        let cooldown = tapRecoveryCooldownUntil.removeValue(forKey: oldPID)
+
+        tap.rebind(to: app)
+        volumeState.removeVolume(for: oldPID)
+        taps[app.id] = tap
+        if let route { appDeviceRouting[app.id] = route }
+        if followedDefault { followsDefault.insert(app.id) }
+        if let cooldown { tapRecoveryCooldownUntil[app.id] = cooldown }
+
+        logger.info("Adopted pre-armed tap for \(app.name, privacy: .public) before playback")
+        return true
+    }
+
+    /// A restoring description can absorb a replacement process object only when every
+    /// observed Core Audio bundle belongs to the description. Shared helpers that were
+    /// deliberately excluded from bundle restoration still require an object-ID handoff.
+    /// Missing bundle metadata is treated conservatively for the same reason.
+    private func restoringTapCoversObservedProcesses(
+        _ tap: ProcessTapControlling,
+        for app: AudioApp
+    ) -> Bool {
+        guard tap.restoresProcessByBundleID else { return false }
+        let configured = tap.configuredRestorationBundleIDs
+        guard Set(app.restorationBundleIDs).isSubset(of: configured) else { return false }
+        guard !app.processObjectIDs.isEmpty else { return true }
+        guard !app.hasUnresolvedAudioProcessBundleMetadata else { return false }
+        let observed = Set(app.audioProcessBundleIDs.filter { !$0.isEmpty })
+        return !observed.isEmpty && observed.isSubset(of: configured)
+    }
+
+    private func allocateStandbyPID() -> pid_t {
+        while taps[nextStandbyPID] != nil {
+            nextStandbyPID &-= 1
+        }
+        let allocated = nextStandbyPID
+        nextStandbyPID &-= 1
+        return allocated
+    }
+
+    /// Releases bundle-restoring graphs that no longer have a pin or saved processing
+    /// reason to remain armed while their process is absent. A connected tap is retained
+    /// so a paused app can resume without reopening the first-buffer discovery race.
+    private func retireUnneededRestoringTaps(for identifier: String? = nil) {
+        let connectedPIDs = Set(processMonitor.connectedApps.map(\.id))
+        let retiredPIDs = taps.compactMap { pid, tap -> pid_t? in
+            guard tap.restoresProcessByBundleID,
+                  !connectedPIDs.contains(pid),
+                  identifier == nil || tap.app.persistenceIdentifier == identifier,
+                  !shouldRetainRestoringTapWhileAbsent(for: tap.app.persistenceIdentifier) else {
+                return nil
+            }
+            return pid
+        }
+
+        for pid in retiredPIDs {
+            pendingCleanup.removeValue(forKey: pid)?.cancel()
+            taps.removeValue(forKey: pid)?.invalidate()
+            appDeviceRouting.removeValue(forKey: pid)
+            followsDefault.remove(pid)
+            appliedPIDs.remove(pid)
+            tapRecoveryCooldownUntil.removeValue(forKey: pid)
+            volumeState.removeVolume(for: pid)
+        }
+    }
+
+    private func inactiveDevicePlan(for identifier: String) -> (uids: [String], followsDefault: Bool)? {
+        let mode = settingsManager.getDeviceSelectionMode(for: identifier) ?? .single
+        if mode == .multi,
+           let selected = settingsManager.getSelectedDeviceUIDs(for: identifier) {
+            let available = orderedSelectedDeviceUIDs(
+                Set(selected.filter { deviceMonitor.device(for: $0) != nil })
+            )
+            if !available.isEmpty { return (available, false) }
+        }
+
+        if settingsManager.isFollowingDefault(for: identifier),
+           let defaultUID = deviceVolumeMonitor.defaultDeviceUID {
+            return ([defaultUID], true)
+        }
+        if let savedUID = settingsManager.getDeviceRouting(for: identifier),
+           deviceMonitor.device(for: savedUID) != nil {
+            return ([savedUID], false)
+        }
+        guard let defaultUID = deviceVolumeMonitor.defaultDeviceUID else { return nil }
+        return ([defaultUID], true)
+    }
+
+    private func clearRouteRetry(for identifier: String) {
+        routeRetryTasks.removeValue(forKey: identifier)?.cancel()
+        routeRetryAttempts.removeValue(forKey: identifier)
+    }
+
+    /// Records a new desired route. Retried/reconciliation operations deliberately reuse
+    /// the current revision; only a user or system routing decision advances it.
+    @discardableResult
+    private func advanceRouteIntent(
+        for identifier: String,
+        plan explicitPlan: RouteIntentPlan? = nil
+    ) -> UInt64 {
+        let next = (routeIntentRevisions[identifier] ?? 0) &+ 1
+        routeIntentRevisions[identifier] = next
+        if let plan = explicitPlan ?? inactiveDevicePlan(for: identifier).map({
+            RouteIntentPlan(uids: $0.uids, followsDefault: $0.followsDefault)
+        }) {
+            routeIntentPlans[identifier] = plan
+        } else {
+            routeIntentPlans.removeValue(forKey: identifier)
+        }
+        routeReconcileTasks.removeValue(forKey: identifier)?.cancel()
+        clearRouteRetry(for: identifier)
+        return next
+    }
+
+    private func currentRouteIntent(for identifier: String) -> UInt64 {
+        routeIntentRevisions[identifier] ?? 0
+    }
+
+    /// A stale HAL operation may already have changed the physical aggregate before its
+    /// actor continuation resumes. Do not publish its metadata; queue one current-plan
+    /// reconciliation so the newest user intent wins physically as well as in the UI.
+    private func routeCompletionIsCurrent(
+        identifier: String,
+        revision: UInt64,
+        tap: any ProcessTapControlling
+    ) -> Bool {
+        guard currentRouteIntent(for: identifier) == revision,
+              taps.values.contains(where: { $0 === tap }) else {
+            scheduleRouteReconciliation(for: identifier)
+            return false
+        }
+        return true
+    }
+
+    private func scheduleRouteReconciliation(for identifier: String) {
+        guard routeReconcileTasks[identifier] == nil else { return }
+        routeReconcileTasks[identifier] = Task { @MainActor [weak self] in
+            // Coalesce multiple stale completions from the same burst of route changes.
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            self.routeReconcileTasks.removeValue(forKey: identifier)
+            self.refreshInactiveTapRouting(identifier: identifier)
+        }
+    }
+
+    private func scheduleRouteRetry(for identifier: String) {
+        guard routeRetryTasks[identifier] == nil else { return }
+        let attempt = (routeRetryAttempts[identifier] ?? 0) + 1
+        guard attempt <= 3 else {
+            logger.error("Route retry limit reached for \(identifier, privacy: .public)")
+            return
+        }
+        routeRetryAttempts[identifier] = attempt
+        let delayNanos = UInt64(attempt) * 250_000_000
+        routeRetryTasks[identifier] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanos)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.routeRetryTasks.removeValue(forKey: identifier)
+            self.refreshInactiveTapRouting(identifier: identifier)
+        }
+    }
+
+    private func refreshInactiveTapRouting(identifier: String) {
+        guard let (pid, tap) = taps.first(where: {
+            $0.value.app.persistenceIdentifier == identifier
+        }) else { return }
+        let plan: RouteIntentPlan
+        if let intended = routeIntentPlans[identifier] {
+            plan = intended
+        } else if let persisted = inactiveDevicePlan(for: identifier) {
+            plan = RouteIntentPlan(
+                uids: persisted.uids,
+                followsDefault: persisted.followsDefault
+            )
+        } else {
+            return
+        }
+
+        // For a recorded follow-default intent, its target is authoritative even while
+        // DeviceVolumeMonitor is still waiting for the corresponding HAL callback.
+        let preferredSource = plan.followsDefault ? plan.uids.first : nil
+        let devicesNeedUpdate = tap.currentDeviceUIDs != plan.uids
+        let sourceNeedsUpdate = tap.tapSourceDeviceUID != preferredSource
+        guard devicesNeedUpdate || sourceNeedsUpdate else {
+            appDeviceRouting[pid] = plan.uids[0]
+            if plan.followsDefault {
+                followsDefault.insert(pid)
+            } else {
+                followsDefault.remove(pid)
+            }
+            applyTapOutputState(to: tap, for: pid, deviceUIDs: plan.uids)
+            return
+        }
+        appliedPIDs.remove(pid)
+        let routeRevision = currentRouteIntent(for: identifier)
+
+        Task {
+            do {
+                let transition = self.deviceAUTransition(on: tap, to: plan.uids[0])
+                if devicesNeedUpdate {
+                    try await tap.updateDevices(
+                        to: plan.uids,
+                        preferredTapSourceDeviceUID: preferredSource,
+                        sourceDeviceDead: false,
+                        deviceAUTransition: transition
+                    )
+                } else {
+                    try await tap.refreshTapSource(
+                        preferredSource,
+                        deviceAUTransition: transition
+                    )
+                }
+                guard self.routeCompletionIsCurrent(
+                    identifier: identifier,
+                    revision: routeRevision,
+                    tap: tap
+                ) else { return }
+                guard let currentPID = self.taps.first(where: { $0.value === tap })?.key else {
+                    return
+                }
+                self.appDeviceRouting[currentPID] = plan.uids[0]
+                if plan.followsDefault {
+                    self.followsDefault.insert(currentPID)
+                } else {
+                    self.followsDefault.remove(currentPID)
+                }
+                guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: plan.uids) else {
+                    return
+                }
+                self.applyAutoEQToTap(tap)
+                self.applyDeviceAUChainToTap(tap)
+                self.appliedPIDs.insert(currentPID)
+                self.clearRouteRetry(for: identifier)
+            } catch {
+                guard self.routeCompletionIsCurrent(
+                    identifier: identifier,
+                    revision: routeRevision,
+                    tap: tap
+                ) else { return }
+                if let currentPID = self.taps.first(where: { $0.value === tap })?.key {
+                    self.appDeviceRouting[currentPID] = tap.currentDeviceUIDs.first
+                    self.appliedPIDs.remove(currentPID)
+                }
+                self.scheduleRouteRetry(for: identifier)
+                self.logger.error("Failed to update pre-armed route for \(identifier, privacy: .public): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Starts bundle-only taps for pinned apps even when no process currently exists.
+    /// `CATapDescription.bundleIDs` plus process restoration is available on macOS 26;
+    /// the active aggregate then reads (and therefore mutes) the matching process from its
+    /// first output buffer while applying the already-loaded saved gain.
+    private func clearColdStartRetry(for identifier: String) {
+        coldStartRetryTasks.removeValue(forKey: identifier)?.cancel()
+        coldStartRetryAttempts.removeValue(forKey: identifier)
+    }
+
+    private func scheduleColdStartRetry(for identifier: String) {
+        guard coldStartRetryTasks[identifier] == nil,
+              settingsManager.isPinned(identifier),
+              !settingsManager.isIgnored(identifier) else { return }
+        let attempt = (coldStartRetryAttempts[identifier] ?? 0) + 1
+        guard attempt <= 4 else {
+            logger.error("Cold-start pre-arm retry limit reached for \(identifier, privacy: .public)")
+            return
+        }
+        coldStartRetryAttempts[identifier] = attempt
+        let delayNanos = UInt64(attempt) * 250_000_000
+        coldStartRetryTasks[identifier] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanos)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.coldStartRetryTasks.removeValue(forKey: identifier)
+            guard self.settingsManager.isPinned(identifier),
+                  !self.settingsManager.isIgnored(identifier) else {
+                self.coldStartRetryAttempts.removeValue(forKey: identifier)
+                return
+            }
+            self.preparePinnedColdStartTaps()
+        }
+    }
+
+    private func preparePinnedColdStartTaps() {
+        guard coldStartPrearmingEnabled,
+              bundleProcessRestorationAvailable,
+              permission.status == .authorized else { return }
+
+        let connectedPIDs = Set(processMonitor.connectedApps.map(\.id))
+
+        for info in settingsManager.getPinnedAppInfo() {
+            guard let bundleID = info.bundleID, !bundleID.isEmpty else {
+                clearColdStartRetry(for: info.persistenceIdentifier)
+                continue
+            }
+
+            // An unsafe live object-ID tap cannot restore the next launch. Once Core Audio
+            // reports that process gone, synchronously join and remove its producer before
+            // attaching the shared persistent AU strip to a bundle-only standby. Keeping
+            // both IOProcs alive during the ordinary stale-tap grace period would let them
+            // race over the same stateful Audio Unit.
+            let exitedUnsafePIDs = taps.compactMap { pid, tap -> pid_t? in
+                guard tap.app.persistenceIdentifier == info.persistenceIdentifier,
+                      !tap.restoresProcessByBundleID,
+                      !connectedPIDs.contains(pid) else { return nil }
+                return pid
+            }
+            for pid in exitedUnsafePIDs {
+                pendingCleanup.removeValue(forKey: pid)?.cancel()
+                taps.removeValue(forKey: pid)?.invalidateForHandoff()
+                appDeviceRouting.removeValue(forKey: pid)
+                followsDefault.remove(pid)
+                appliedPIDs.remove(pid)
+                tapRecoveryCooldownUntil.removeValue(forKey: pid)
+                volumeState.removeVolume(for: pid)
+            }
+
+            guard !taps.values.contains(where: {
+                $0.app.persistenceIdentifier == info.persistenceIdentifier
+            }) else {
+                clearColdStartRetry(for: info.persistenceIdentifier)
+                continue
+            }
+            guard let plan = inactiveDevicePlan(for: info.persistenceIdentifier) else {
+                // HAL/default-device discovery can lag engine startup. Keep the pinned
+                // bundle eligible without waiting for an unrelated process lifecycle.
+                scheduleColdStartRetry(for: info.persistenceIdentifier)
+                continue
+            }
+
+            let standbyPID = allocateStandbyPID()
+            let app = AudioApp(
+                id: standbyPID,
+                processObjectIDs: [],
+                name: info.displayName,
+                icon: DisplayableApp.loadIcon(bundleID: bundleID),
+                bundleID: bundleID,
+                audioProcessBundleIDs: info.restorationBundleIDs ?? []
+            )
+
+            _ = volumeState.loadSavedDeviceSelectionMode(
+                for: standbyPID,
+                identifier: info.persistenceIdentifier
+            )
+            _ = volumeState.loadSavedSelectedDeviceUIDs(
+                for: standbyPID,
+                identifier: info.persistenceIdentifier
+            )
+            _ = volumeState.loadSavedVolume(for: standbyPID, identifier: info.persistenceIdentifier)
+            _ = volumeState.loadSavedBoost(for: standbyPID, identifier: info.persistenceIdentifier)
+            _ = volumeState.loadSavedMute(for: standbyPID, identifier: info.persistenceIdentifier)
+
+            let preferredSource = preferredTapSourceDeviceUID(
+                forOutputUIDs: plan.uids,
+                isFollowsDefault: plan.followsDefault
+            )
+            do {
+                let tap = try tapFactory(app, plan.uids, preferredSource)
+                applyTapOutputState(to: tap, for: standbyPID, deviceUIDs: plan.uids)
+                // Publish every persisted processor before AudioDeviceStart. The bundle
+                // restoration can attach a launching process at any instant, so attaching
+                // an AU after activation would create a short gain-only/dry window.
+                attachPersistentMixerStrip(to: tap, for: app)
+                applyDeviceAUChainToTap(tap, deviceUID: plan.uids[0])
+                loadPersistedAUBypassState(to: tap, for: app, deviceUID: plan.uids[0])
+                let initial = tapInitialState(
+                    forApp: app,
+                    primaryDeviceUID: plan.uids[0],
+                    deviceVolume: tap.currentDeviceVolume
+                )
+                try tap.activate(initial: initial)
+                guard tap.restoresProcessByBundleID else {
+                    tap.invalidate()
+                    volumeState.removeVolume(for: standbyPID)
+                    clearColdStartRetry(for: info.persistenceIdentifier)
+                    continue
+                }
+
+                taps[standbyPID] = tap
+                appDeviceRouting[standbyPID] = plan.uids[0]
+                if plan.followsDefault { followsDefault.insert(standbyPID) }
+                appliedPIDs.insert(standbyPID)
+
+                if initial.autoEQProfile == nil { applyAutoEQToTap(tap) }
+                syncAppAUFailedIDs(for: app.persistenceIdentifier)
+                syncDeviceAUFailedIDs(for: plan.uids[0])
+                clearColdStartRetry(for: info.persistenceIdentifier)
+                logger.info("Pre-armed cold-start tap for \(info.displayName, privacy: .public)")
+            } catch {
+                volumeState.removeVolume(for: standbyPID)
+                scheduleColdStartRetry(for: info.persistenceIdentifier)
+                logger.error("Failed to pre-arm \(info.displayName, privacy: .public): \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Skips AutoEQ entirely for devices that don't support it (speakers, HDMI, etc.).
     /// If the profile isn't loaded yet, triggers an async fetch and applies when ready.
-    private func applyDeviceAUChainToTap(_ tap: any ProcessTapControlling) {
-        guard let deviceUID = tap.currentDeviceUID else { return }
+    private func applyDeviceAUChainToTap(
+        _ tap: any ProcessTapControlling,
+        deviceUID explicitDeviceUID: String? = nil
+    ) {
+        guard let deviceUID = explicitDeviceUID ?? tap.currentDeviceUID else { return }
         let chain = settingsManager.getDeviceAUEffectChain(for: deviceUID)
         tap.updateDeviceAUEffectChain(chain)
         var state = persistedDeviceAUState(for: deviceUID)
@@ -1648,12 +2319,18 @@ final class AudioEngine {
     ///   - app: The app to route
     ///   - deviceUID: The device UID to route to, or nil to follow system default
     func setDevice(for app: AudioApp, deviceUID: String?) {
+        let identifier = app.persistenceIdentifier
+        let routeRevision: UInt64
         if let deviceUID = deviceUID {
             // Explicit device selection - stop following default
             followsDefault.remove(app.id)
             // Defensive: re-persist routing even if in-memory state matches,
             // to guard against settings file corruption or incomplete prior writes
             settingsManager.setDeviceRouting(for: app.persistenceIdentifier, deviceUID: deviceUID)
+            routeRevision = advanceRouteIntent(
+                for: identifier,
+                plan: RouteIntentPlan(uids: [deviceUID], followsDefault: false)
+            )
 
             // If transitioning from follows-default to explicit and tap has a stream-specific
             // source, refresh to mixdown so it won't go stale when the default changes later.
@@ -1664,9 +2341,20 @@ final class AudioEngine {
                             self.deviceAUTransition(on: tap, to: $0)
                         }
                         try await tap.refreshTapSource(nil, deviceAUTransition: transition)
-                        self.applyTapOutputState(to: tap, for: app.id)
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: routeRevision,
+                            tap: tap
+                        ) else { return }
+                        guard self.applyTapOutputStateIfRegistered(to: tap) else { return }
                         self.applyDeviceAUChainToTap(tap)
                     } catch {
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: routeRevision,
+                            tap: tap
+                        ) else { return }
+                        self.scheduleRouteRetry(for: identifier)
                         self.logger.error("Failed to refresh tap source for \(app.name): \(error)")
                     }
                 }
@@ -1681,11 +2369,16 @@ final class AudioEngine {
 
             // Route to current default (if available)
             guard let defaultUID = deviceVolumeMonitor.defaultDeviceUID else {
+                _ = advanceRouteIntent(for: identifier)
                 // No default available yet - routing will happen when default becomes available
                 // via handleDefaultDeviceChanged callback
                 logger.warning("No default device available for \(app.name), will route when available")
                 return
             }
+            routeRevision = advanceRouteIntent(
+                for: identifier,
+                plan: RouteIntentPlan(uids: [defaultUID], followsDefault: true)
+            )
             guard appDeviceRouting[app.id] != defaultUID else { return }
             appDeviceRouting[app.id] = defaultUID
         }
@@ -1703,11 +2396,28 @@ final class AudioEngine {
                         sourceDeviceDead: false,
                         deviceAUTransition: transition
                     )
-                    self.applyTapOutputState(to: tap, for: app.id, deviceUIDs: [targetUID])
+                    guard self.routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: routeRevision,
+                        tap: tap
+                    ) else { return }
+                    guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: [targetUID]) else {
+                        return
+                    }
                     self.applyAutoEQToTap(tap)
                     self.applyDeviceAUChainToTap(tap)
                     self.logger.debug("Switched \(app.name) to device: \(targetUID)")
                 } catch {
+                    guard self.routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: routeRevision,
+                        tap: tap
+                    ) else { return }
+                    if let currentPID = self.taps.first(where: { $0.value === tap })?.key {
+                        self.appDeviceRouting[currentPID] = tap.currentDeviceUIDs.first
+                        self.appliedPIDs.remove(currentPID)
+                    }
+                    self.scheduleRouteRetry(for: identifier)
                     self.logger.error("Failed to switch device for \(app.name): \(error.localizedDescription)")
                 }
             }
@@ -1739,6 +2449,7 @@ final class AudioEngine {
         volumeState.setDeviceSelectionMode(for: app.id, to: mode, identifier: app.persistenceIdentifier)
 
         guard previousMode != mode else { return }
+        advanceRouteIntent(for: app.persistenceIdentifier)
 
         Task {
             await updateTapForCurrentMode(for: app)
@@ -1758,6 +2469,7 @@ final class AudioEngine {
 
         guard previousUIDs != uids,
               getDeviceSelectionMode(for: app) == .multi else { return }
+        advanceRouteIntent(for: app.persistenceIdentifier)
 
         Task {
             await updateTapForCurrentMode(for: app)
@@ -1770,6 +2482,9 @@ final class AudioEngine {
     func reconcileMultiOutputPriority() {
         let multiOutputApps = apps.filter {
             getDeviceSelectionMode(for: $0) == .multi
+        }
+        for app in multiOutputApps {
+            advanceRouteIntent(for: app.persistenceIdentifier)
         }
         Task {
             for app in multiOutputApps {
@@ -1791,6 +2506,8 @@ final class AudioEngine {
 
     /// Updates tap configuration based on current mode and selected devices
     private func updateTapForCurrentMode(for app: AudioApp) async {
+        let identifier = app.persistenceIdentifier
+        let routeRevision = currentRouteIntent(for: identifier)
         let mode = getDeviceSelectionMode(for: app)
 
         let deviceUIDs: [String]
@@ -1828,11 +2545,32 @@ final class AudioEngine {
                         sourceDeviceDead: false,
                         deviceAUTransition: transition
                     )
-                    appDeviceRouting[app.id] = deviceUIDs[0]
-                    applyTapOutputState(to: tap, for: app.id, deviceUIDs: deviceUIDs)
+                    guard routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: routeRevision,
+                        tap: tap
+                    ) else { return }
+                    guard let currentPID = taps.first(where: { $0.value === tap })?.key else {
+                        return
+                    }
+                    appDeviceRouting[currentPID] = deviceUIDs[0]
+                    guard applyTapOutputStateIfRegistered(to: tap, deviceUIDs: deviceUIDs) else {
+                        return
+                    }
                     applyDeviceAUChainToTap(tap)
+                    clearRouteRetry(for: tap.app.persistenceIdentifier)
                     logger.debug("Updated \(app.name) to \(deviceUIDs.count) device(s)")
                 } catch {
+                    guard routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: routeRevision,
+                        tap: tap
+                    ) else { return }
+                    if let currentPID = taps.first(where: { $0.value === tap })?.key {
+                        appDeviceRouting[currentPID] = tap.currentDeviceUIDs.first
+                        appliedPIDs.remove(currentPID)
+                    }
+                    scheduleRouteRetry(for: tap.app.persistenceIdentifier)
                     logger.error("Failed to update devices for \(app.name): \(error.localizedDescription)")
                 }
             } else {
@@ -1847,48 +2585,59 @@ final class AudioEngine {
     /// Creates a tap with the specified device UIDs
     private func ensureTapWithDevices(for app: AudioApp, deviceUIDs: [String]) {
         guard !deviceUIDs.isEmpty else { return }
-        guard taps[app.id] == nil else { return }
+        let provisioningApp = appWithPersistedRestorationIdentity(app)
+        _ = adoptRestoringTap(for: provisioningApp)
+        guard taps[provisioningApp.id] == nil else { return }
         guard permission.status == .authorized else { return }
-        retireOtherTaps(for: app)
+        retireOtherTaps(for: provisioningApp)
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(provisioningApp.id))
         do {
-            let tap = try tapFactory(app, deviceUIDs, preferredTapSourceUID)
-            applyTapOutputState(to: tap, for: app.id, deviceUIDs: deviceUIDs)
+            let tap = try tapFactory(provisioningApp, deviceUIDs, preferredTapSourceUID)
+            applyTapOutputState(to: tap, for: provisioningApp.id, deviceUIDs: deviceUIDs)
+            attachPersistentMixerStrip(to: tap, for: provisioningApp)
+            applyDeviceAUChainToTap(tap, deviceUID: deviceUIDs[0])
+            loadPersistedAUBypassState(to: tap, for: provisioningApp, deviceUID: deviceUIDs[0])
 
             let initial = tapInitialState(
-                forApp: app,
+                forApp: provisioningApp,
                 primaryDeviceUID: deviceUIDs[0],
                 deviceVolume: tap.currentDeviceVolume
             )
             try tap.activate(initial: initial)
-            taps[app.id] = tap
-            appDeviceRouting[app.id] = deviceUIDs[0]
+            taps[provisioningApp.id] = tap
+            appDeviceRouting[provisioningApp.id] = deviceUIDs[0]
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
             if initial.autoEQProfile == nil {
                 applyAutoEQToTap(tap)
             }
 
-            attachPersistentMixerStrip(to: tap, for: app)
-            applyDeviceAUChainToTap(tap)
-            loadPersistedAUBypassState(for: app, deviceUID: deviceUIDs[0])
+            syncAppAUFailedIDs(for: provisioningApp.persistenceIdentifier)
+            syncDeviceAUFailedIDs(for: deviceUIDs[0])
 
-            logger.debug("Created tap for \(app.name) on \(deviceUIDs.count) device(s)")
+            logger.debug("Created tap for \(provisioningApp.name) on \(deviceUIDs.count) device(s)")
         } catch {
-            logger.error("Failed to create tap for \(app.name): \(error.localizedDescription)")
+            logger.error("Failed to create tap for \(provisioningApp.name): \(error.localizedDescription)")
         }
     }
 
     func applyPersistedSettings() {
         guard permission.status == .authorized else { return }
+        for app in processMonitor.connectedApps
+        where settingsManager.isPinned(app.persistenceIdentifier) {
+            settingsManager.updatePinnedAppRestorationBundleIDs(
+                app.persistenceIdentifier,
+                bundleIDs: app.restorationBundleIDs
+            )
+        }
         preparePersistentMixerStrips()
 
         // Warm the AutoEQ cache for every (app, device) selection so that subsequent
         // tap activations can apply correction synchronously inside activate(initial:)
         // instead of falling back to the async resolve path. Imported profiles are
         // already loaded by AutoEQProfileManager.init.
-        let selectedProfileIDs: Set<String> = Set(apps.compactMap { app -> String? in
+        let selectedProfileIDs: Set<String> = Set(appsForTapProvisioning.compactMap { app -> String? in
             let deviceUID = appDeviceRouting[app.id] ?? deviceVolumeMonitor.defaultDeviceUID
             guard let deviceUID, let selection = settingsManager.getAutoEQSelection(for: deviceUID) else { return nil }
             return selection.isEnabled ? selection.profileID : nil
@@ -1900,14 +2649,49 @@ final class AudioEngine {
             }
         }
 
-        for app in apps {
-            if let existing = taps[app.id],
-               existing.app.processObjectIDs != app.processObjectIDs {
-                // The logical app gained/lost a CoreAudio process object. CATapDescription is
-                // immutable, so hand off to a fresh tap while retaining the persistent strip.
-                existing.invalidateForHandoff()
-                taps.removeValue(forKey: app.id)
-                appliedPIDs.remove(app.id)
+        for app in appsForTapProvisioning {
+            _ = adoptRestoringTap(for: app)
+            if let existing = taps[app.id] {
+                let processMembershipChanged = existing.app.processObjectIDs != app.processObjectIDs
+                let processBundleMetadataChanged =
+                    existing.app.audioProcessBundleIDs != app.audioProcessBundleIDs
+                    || existing.app.hasUnresolvedAudioProcessBundleMetadata
+                        != app.hasUnresolvedAudioProcessBundleMetadata
+                let logicalIdentityChanged = existing.app.persistenceIdentifier != app.persistenceIdentifier
+                    || existing.app.bundleID != app.bundleID
+                let missingRestorationIdentity = existing.restoresProcessByBundleID
+                    && !Set(app.restorationBundleIDs)
+                        .isSubset(of: existing.configuredRestorationBundleIDs)
+                let hasUncoveredObservedProcess = existing.restoresProcessByBundleID
+                    && !restoringTapCoversObservedProcesses(existing, for: app)
+                let processMembershipRequiresRebuild = processMembershipChanged
+                    && (!existing.restoresProcessByBundleID || hasUncoveredObservedProcess)
+                let processMetadataRequiresRebuild = processBundleMetadataChanged
+                    && hasUncoveredObservedProcess
+                let canUpgradeToRestoration = bundleProcessRestorationAvailable
+                    && !existing.restoresProcessByBundleID
+                    && app.supportsSafeProcessRestoration
+                    && !processMonitor.activeApps.contains(where: { $0.id == app.id })
+                if processMembershipRequiresRebuild
+                    || processMetadataRequiresRebuild
+                    || canUpgradeToRestoration
+                    || logicalIdentityChanged
+                    || missingRestorationIdentity {
+                    // The logical app gained/lost a CoreAudio process object. Core Audio's
+                    // live description setter can block indefinitely on an active tap, so use
+                    // the bounded synchronous producer handoff for membership or identity
+                    // changes. This also handles metadata settling on a stable object ID.
+                    existing.invalidateForHandoff()
+                    taps.removeValue(forKey: app.id)
+                    appliedPIDs.remove(app.id)
+                } else if existing.app.name != app.name
+                    || existing.app.isHelperBacked != app.isHelperBacked
+                    || existing.app.audioProcessBundleIDs != app.audioProcessBundleIDs
+                    || existing.app.hasUnresolvedAudioProcessBundleMetadata
+                        != app.hasUnresolvedAudioProcessBundleMetadata
+                    || processMembershipChanged {
+                    existing.rebind(to: app)
+                }
             }
             guard !appliedPIDs.contains(app.id) else { continue }
             guard !settingsManager.isIgnored(app.persistenceIdentifier) else { continue }
@@ -1931,6 +2715,10 @@ final class AudioEngine {
                     )
                     if !availableUIDs.isEmpty {
                         logger.debug("Restoring multi-device mode for \(app.name) with \(availableUIDs.count) device(s)")
+                        if let existing = taps[app.id], existing.currentDeviceUIDs != availableUIDs {
+                            refreshInactiveTapRouting(identifier: app.persistenceIdentifier)
+                            continue
+                        }
                         ensureTapWithDevices(for: app, deviceUIDs: availableUIDs)
 
                         // Mark as applied if tap created successfully
@@ -1988,6 +2776,8 @@ final class AudioEngine {
             // after the default changed while it was absent), switch it.
             if let existingTap = taps[app.id], existingTap.currentDeviceUIDs != [deviceUID] {
                 let preferredSource = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
+                let identifier = app.persistenceIdentifier
+                let routeRevision = currentRouteIntent(for: identifier)
                 Task {
                     do {
                         let transition = self.deviceAUTransition(on: existingTap, to: deviceUID)
@@ -1997,10 +2787,28 @@ final class AudioEngine {
                             sourceDeviceDead: false,
                             deviceAUTransition: transition
                         )
-                        self.applyTapOutputState(to: existingTap, for: app.id, deviceUIDs: [deviceUID])
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: routeRevision,
+                            tap: existingTap
+                        ) else { return }
+                        guard self.applyTapOutputStateIfRegistered(to: existingTap, deviceUIDs: [deviceUID]) else {
+                            return
+                        }
                         self.applyAutoEQToTap(existingTap)
                         self.applyDeviceAUChainToTap(existingTap)
+                        self.clearRouteRetry(for: existingTap.app.persistenceIdentifier)
                     } catch {
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: routeRevision,
+                            tap: existingTap
+                        ) else { return }
+                        if let currentPID = self.taps.first(where: { $0.value === existingTap })?.key {
+                            self.appDeviceRouting[currentPID] = existingTap.currentDeviceUIDs.first
+                            self.appliedPIDs.remove(currentPID)
+                        }
+                        self.scheduleRouteRetry(for: existingTap.app.persistenceIdentifier)
                         self.logger.error("Failed to re-route \(app.name) to \(deviceUID): \(error.localizedDescription)")
                     }
                 }
@@ -2031,22 +2839,28 @@ final class AudioEngine {
     }
 
     private func ensureTapExists(for app: AudioApp, deviceUID: String) {
-        guard taps[app.id] == nil else { return }
+        let provisioningApp = appWithPersistedRestorationIdentity(app)
+        _ = adoptRestoringTap(for: provisioningApp)
+        guard taps[provisioningApp.id] == nil else { return }
         guard permission.status == .authorized else { return }
-        retireOtherTaps(for: app)
+        retireOtherTaps(for: provisioningApp)
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(provisioningApp.id))
         do {
-            let tap = try tapFactory(app, [deviceUID], preferredTapSourceUID)
-            applyTapOutputState(to: tap, for: app.id, deviceUIDs: [deviceUID])
+            let tap = try tapFactory(provisioningApp, [deviceUID], preferredTapSourceUID)
+            applyTapOutputState(to: tap, for: provisioningApp.id, deviceUIDs: [deviceUID])
+            // The processor graph is part of activation state, not a post-start mutation.
+            attachPersistentMixerStrip(to: tap, for: provisioningApp)
+            applyDeviceAUChainToTap(tap, deviceUID: deviceUID)
+            loadPersistedAUBypassState(to: tap, for: provisioningApp, deviceUID: deviceUID)
 
             let initial = tapInitialState(
-                forApp: app,
+                forApp: provisioningApp,
                 primaryDeviceUID: deviceUID,
                 deviceVolume: tap.currentDeviceVolume
             )
             try tap.activate(initial: initial)
-            taps[app.id] = tap
+            taps[provisioningApp.id] = tap
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
             // Imported profiles always hit the synchronous path above.
@@ -2054,21 +2868,12 @@ final class AudioEngine {
                 applyAutoEQToTap(tap)
             }
 
-            // Attach the long-lived per-app strip; this does not instantiate another AU.
-            attachPersistentMixerStrip(to: tap, for: app)
-            syncAppAUFailedIDs(for: app.persistenceIdentifier)
-            let savedDeviceAU = settingsManager.getDeviceAUEffectChain(for: deviceUID)
-            if !savedDeviceAU.isEmpty {
-                tap.updateDeviceAUEffectChain(savedDeviceAU)
-                deviceAU[deviceUID, default: AUChainState()].entries = savedDeviceAU
-                syncDeviceAUFailedIDs(for: deviceUID)
-            }
+            syncAppAUFailedIDs(for: provisioningApp.persistenceIdentifier)
+            syncDeviceAUFailedIDs(for: deviceUID)
 
-            loadPersistedAUBypassState(for: app, deviceUID: deviceUID)
-
-            logger.debug("Created tap for \(app.name)")
+            logger.debug("Created tap for \(provisioningApp.name)")
         } catch {
-            logger.error("Failed to create tap for \(app.name): \(error.localizedDescription)")
+            logger.error("Failed to create tap for \(provisioningApp.name): \(error.localizedDescription)")
         }
     }
 
@@ -2076,8 +2881,12 @@ final class AudioEngine {
     /// old IOProc before the replacement is created, so no old callback can overlap the
     /// new tap through one stateful Console 1 instance.
     private func retireOtherTaps(for app: AudioApp) {
+        let incomingObjectIDs = Set(app.processObjectIDs)
         let oldPIDs = taps.compactMap { pid, tap in
-            pid != app.id && tap.app.persistenceIdentifier == app.persistenceIdentifier
+            let sharesProcessObject = !incomingObjectIDs.isEmpty
+                && !incomingObjectIDs.isDisjoint(with: tap.app.processObjectIDs)
+            return pid != app.id
+                && (tap.app.persistenceIdentifier == app.persistenceIdentifier || sharesProcessObject)
                 ? pid
                 : nil
         }
@@ -2158,23 +2967,42 @@ final class AudioEngine {
     /// Routes all followsDefault apps to the given device UID and switches their taps.
     /// Early-exits if all apps are already routed to the target (avoids unnecessary tap switches).
     private func routeFollowsDefaultApps(to targetUID: String) {
-        guard !followsDefault.allSatisfy({ appDeviceRouting[$0] == targetUID }) else { return }
+        // `setDefaultDevice` writes HAL synchronously, but the monitor cache updates on a
+        // later listener callback. The requested target is already the desired tap source.
+        let preferredTapSourceUID: String? = targetUID
+        guard !followsDefault.allSatisfy({ pid in
+            guard appDeviceRouting[pid] == targetUID else { return false }
+            guard let tap = taps[pid] else { return true }
+            return tap.currentDeviceUIDs == [targetUID]
+                && tap.tapSourceDeviceUID == preferredTapSourceUID
+        }) else { return }
 
+        var tapsToSwitch: [(
+            appName: String,
+            identifier: String,
+            revision: UInt64,
+            tap: any ProcessTapControlling
+        )] = []
         for pid in followsDefault {
+            let priorTarget = appDeviceRouting[pid]
             appDeviceRouting[pid] = targetUID
-        }
-
-        var tapsToSwitch: [(appID: pid_t, appName: String, tap: any ProcessTapControlling)] = []
-        for app in apps {
-            guard followsDefault.contains(app.id), let tap = taps[app.id] else { continue }
-            tapsToSwitch.append((app.id, app.name, tap))
+            guard let tap = taps[pid] else { continue }
+            let identifier = tap.app.persistenceIdentifier
+            let revision = priorTarget == targetUID
+                ? currentRouteIntent(for: identifier)
+                : advanceRouteIntent(
+                    for: identifier,
+                    plan: RouteIntentPlan(uids: [targetUID], followsDefault: true)
+                )
+            guard tap.currentDeviceUIDs != [targetUID]
+                    || tap.tapSourceDeviceUID != preferredTapSourceUID else { continue }
+            tapsToSwitch.append((tap.app.name, identifier, revision, tap))
         }
         guard !tapsToSwitch.isEmpty else { return }
 
         Task {
-            for (appID, appName, tap) in tapsToSwitch {
+            for (appName, identifier, revision, tap) in tapsToSwitch {
                 do {
-                    let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: true)
                     let transition = self.deviceAUTransition(on: tap, to: targetUID)
                     try await tap.switchDevice(
                         to: targetUID,
@@ -2182,10 +3010,28 @@ final class AudioEngine {
                         sourceDeviceDead: false,
                         deviceAUTransition: transition
                     )
-                    self.applyTapOutputState(to: tap, for: appID, deviceUIDs: [targetUID])
+                    guard self.routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: revision,
+                        tap: tap
+                    ) else { continue }
+                    guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: [targetUID]) else {
+                        continue
+                    }
                     self.applyAutoEQToTap(tap)
                     self.applyDeviceAUChainToTap(tap)
+                    self.clearRouteRetry(for: identifier)
                 } catch {
+                    guard self.routeCompletionIsCurrent(
+                        identifier: identifier,
+                        revision: revision,
+                        tap: tap
+                    ) else { continue }
+                    if let currentPID = self.taps.first(where: { $0.value === tap })?.key {
+                        self.appDeviceRouting[currentPID] = tap.currentDeviceUIDs.first
+                        self.appliedPIDs.remove(currentPID)
+                    }
+                    self.scheduleRouteRetry(for: identifier)
                     self.logger.error("Failed to switch \(appName) to \(targetUID): \(error.localizedDescription)")
                 }
             }
@@ -2215,8 +3061,18 @@ final class AudioEngine {
         )
 
         var affectedApps: [AudioApp] = []
-        var singleModeTapsToSwitch: [(tap: any ProcessTapControlling, fallbackUID: String)] = []
-        var multiModeTapsToUpdate: [(tap: any ProcessTapControlling, remainingUIDs: [String])] = []
+        var singleModeTapsToSwitch: [(
+            tap: any ProcessTapControlling,
+            fallbackUID: String,
+            identifier: String,
+            revision: UInt64
+        )] = []
+        var multiModeTapsToUpdate: [(
+            tap: any ProcessTapControlling,
+            remainingUIDs: [String],
+            identifier: String,
+            revision: UInt64
+        )] = []
 
         // Iterate over taps instead of apps - apps list may be empty if disconnected device
         // was the system default (CoreAudio removes app from process list when output disappears)
@@ -2233,7 +3089,20 @@ final class AudioEngine {
                 // Multi-device mode: remove disconnected device, keep others
                 let remainingUIDs = tap.currentDeviceUIDs.filter { $0 != deviceUID }
                 if !remainingUIDs.isEmpty {
-                    multiModeTapsToUpdate.append((tap: tap, remainingUIDs: remainingUIDs))
+                    let identifier = app.persistenceIdentifier
+                    let revision = advanceRouteIntent(
+                        for: identifier,
+                        plan: RouteIntentPlan(
+                            uids: remainingUIDs,
+                            followsDefault: followsDefault.contains(app.id)
+                        )
+                    )
+                    multiModeTapsToUpdate.append((
+                        tap: tap,
+                        remainingUIDs: remainingUIDs,
+                        identifier: identifier,
+                        revision: revision
+                    ))
                     // Update in-memory selection to remove disconnected device (don't persist)
                     var currentSelection = volumeState.getSelectedDeviceUIDs(for: app.id)
                     currentSelection.remove(deviceUID)
@@ -2249,7 +3118,17 @@ final class AudioEngine {
                 // Set to follow default in-memory (UI shows "System Audio")
                 // Don't persist - original device preference stays in settings for reconnection
                 followsDefault.insert(app.id)
-                singleModeTapsToSwitch.append((tap: tap, fallbackUID: fallback.uid))
+                let identifier = app.persistenceIdentifier
+                let revision = advanceRouteIntent(
+                    for: identifier,
+                    plan: RouteIntentPlan(uids: [fallback.uid], followsDefault: true)
+                )
+                singleModeTapsToSwitch.append((
+                    tap: tap,
+                    fallbackUID: fallback.uid,
+                    identifier: identifier,
+                    revision: revision
+                ))
             } else {
                 logger.error("No fallback device available for \(app.name)")
             }
@@ -2259,7 +3138,7 @@ final class AudioEngine {
         if !singleModeTapsToSwitch.isEmpty || !multiModeTapsToUpdate.isEmpty {
             Task {
                 // Handle single-mode switches — source device is dead, skip crossfade
-                for (tap, fallbackUID) in singleModeTapsToSwitch {
+                for (tap, fallbackUID, identifier, revision) in singleModeTapsToSwitch {
                     do {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [fallbackUID], isFollowsDefault: true)
                         let transition = self.deviceAUTransition(on: tap, to: fallbackUID)
@@ -2269,17 +3148,30 @@ final class AudioEngine {
                             sourceDeviceDead: true,
                             deviceAUTransition: transition
                         )
-                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [fallbackUID])
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: [fallbackUID]) else {
+                            continue
+                        }
                         self.applyAutoEQToTap(tap)
                         self.applyDeviceAUChainToTap(tap)
                     } catch {
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        self.scheduleRouteRetry(for: identifier)
                         self.logger.error("Failed to switch \(tap.app.name) to fallback: \(error.localizedDescription)")
                     }
                 }
 
                 // Handle multi-mode updates (remove disconnected device from aggregate)
                 // Source device is dead, skip crossfade
-                for (tap, remainingUIDs) in multiModeTapsToUpdate {
+                for (tap, remainingUIDs, identifier, revision) in multiModeTapsToUpdate {
                     do {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs, isFollowsDefault: self.followsDefault.contains(tap.app.id))
                         let transition = self.deviceAUTransition(on: tap, to: remainingUIDs[0])
@@ -2289,10 +3181,23 @@ final class AudioEngine {
                             sourceDeviceDead: true,
                             deviceAUTransition: transition
                         )
-                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: remainingUIDs)
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: remainingUIDs) else {
+                            continue
+                        }
                         self.applyDeviceAUChainToTap(tap)
                         self.logger.debug("Removed \(deviceName) from \(tap.app.name) multi-device output")
                     } catch {
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        self.scheduleRouteRetry(for: identifier)
                         self.logger.error("Failed to update \(tap.app.name) devices: \(error.localizedDescription)")
                     }
                 }
@@ -2319,7 +3224,11 @@ final class AudioEngine {
         settingsManager.ensureDeviceInPriority(deviceUID)
 
         var affectedApps: [AudioApp] = []
-        var tapsToSwitch: [any ProcessTapControlling] = []
+        var tapsToSwitch: [(
+            tap: any ProcessTapControlling,
+            identifier: String,
+            revision: UInt64
+        )] = []
 
         // Iterate over taps for consistency with handleDeviceDisconnected
         for tap in taps.values {
@@ -2340,12 +3249,17 @@ final class AudioEngine {
             appDeviceRouting[app.id] = deviceUID
             // Remove from followsDefault since we're restoring explicit routing
             followsDefault.remove(app.id)
-            tapsToSwitch.append(tap)
+            let identifier = app.persistenceIdentifier
+            let revision = advanceRouteIntent(
+                for: identifier,
+                plan: RouteIntentPlan(uids: [deviceUID], followsDefault: false)
+            )
+            tapsToSwitch.append((tap: tap, identifier: identifier, revision: revision))
         }
 
         if !tapsToSwitch.isEmpty {
             Task {
-                for tap in tapsToSwitch {
+                for (tap, identifier, revision) in tapsToSwitch {
                     do {
                         let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: false)
                         let transition = self.deviceAUTransition(on: tap, to: deviceUID)
@@ -2355,10 +3269,23 @@ final class AudioEngine {
                             sourceDeviceDead: false,
                             deviceAUTransition: transition
                         )
-                        self.applyTapOutputState(to: tap, for: tap.app.id, deviceUIDs: [deviceUID])
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        guard self.applyTapOutputStateIfRegistered(to: tap, deviceUIDs: [deviceUID]) else {
+                            continue
+                        }
                         self.applyAutoEQToTap(tap)
                         self.applyDeviceAUChainToTap(tap)
                     } catch {
+                        guard self.routeCompletionIsCurrent(
+                            identifier: identifier,
+                            revision: revision,
+                            tap: tap
+                        ) else { continue }
+                        self.scheduleRouteRetry(for: identifier)
                         self.logger.error("Failed to switch \(tap.app.name) back to \(deviceName): \(error.localizedDescription)")
                     }
                 }
@@ -2379,6 +3306,13 @@ final class AudioEngine {
             var updatedUIDs = currentUIDs
             updatedUIDs.insert(deviceUID)
             volumeState.setSelectedDeviceUIDs(for: app.id, to: updatedUIDs, identifier: app.persistenceIdentifier)
+            _ = advanceRouteIntent(
+                for: app.persistenceIdentifier,
+                plan: RouteIntentPlan(
+                    uids: orderedSelectedDeviceUIDs(updatedUIDs),
+                    followsDefault: followsDefault.contains(app.id)
+                )
+            )
             multiModeTapsToUpdate.append(tap)
         }
 
@@ -2556,7 +3490,8 @@ final class AudioEngine {
     }
 
     /// Called when system default output device changes - switches apps that follow default
-    private func handleDefaultDeviceChanged(_ newDefaultUID: String) {
+    @discardableResult
+    private func handleDefaultDeviceChanged(_ newDefaultUID: String) -> Bool {
         // State machine: if we're waiting for macOS to auto-switch after a device connect,
         // check whether this change is the expected auto-switch or user intent.
         if case .pendingAutoSwitch(let pendingUID, let timeoutTask) = outputPriorityState {
@@ -2564,7 +3499,11 @@ final class AudioEngine {
             // create echoes. Consuming before Case 1 ensures FineTune UI changes aren't
             // mistaken for macOS auto-switches.
             if outputEchoTracker.consume(newDefaultUID) {
-                return
+                // A cold-prearm retry or newly connected client may have joined after
+                // the HAL write but before this listener callback, using the old cached
+                // default. Idempotently catch that window up before consuming the echo.
+                routeFollowsDefaultApps(to: newDefaultUID)
+                return true
             }
 
             if newDefaultUID == pendingUID {
@@ -2580,7 +3519,7 @@ final class AudioEngine {
                     routeFollowsDefaultApps(to: newDefaultUID)
                     let deviceName = deviceMonitor.device(for: newDefaultUID)?.name ?? newDefaultUID
                     logger.info("Accepted user change to \(deviceName) (settled >1s)")
-                    return
+                    return true
                 }
 
                 // Case 1: macOS auto-switched to the newly connected device — restore what
@@ -2603,7 +3542,7 @@ final class AudioEngine {
                     connectedDeviceUID: pendingUID,
                     timeoutTask: newTimeoutTask
                 )
-                return
+                return false
             }
 
             // Case 3: Genuine user intent (different device, not our echo) — respect it.
@@ -2614,13 +3553,14 @@ final class AudioEngine {
 
         // Suppress echo from our own priority-based override (when not in pendingAutoSwitch)
         if outputEchoTracker.consume(newDefaultUID) {
-            return
+            routeFollowsDefaultApps(to: newDefaultUID)
+            return true
         }
 
         // If any echo counter is pending, another override is in flight — skip interim routing
         if outputEchoTracker.hasPending {
             logger.debug("Skipping followsDefault routing — echo pending")
-            return
+            return false
         }
 
         // Check if the new default device is known and alive.
@@ -2628,7 +3568,7 @@ final class AudioEngine {
             // Device not yet in monitor's list (e.g., BT device default-changed before device-list
             // notification). Defer — the upcoming handleDeviceConnected will enforce priority.
             logger.debug("Default changed to unknown device \(newDefaultUID), deferring to device list refresh")
-            return
+            return false
         }
 
         let newDeviceIsAlive = isAliveCheck(newDevice.id)
@@ -2636,6 +3576,7 @@ final class AudioEngine {
         if !newDeviceIsAlive {
             // Dead device became default (race with disconnect) — override to priority fallback
             reEvaluateOutputDefault()
+            return false
         } else {
             // Genuine change to a live device — route followsDefault apps
             lastConfirmedDefaultUID = newDefaultUID
@@ -2649,6 +3590,7 @@ final class AudioEngine {
                     showDefaultChangedNotification(newDeviceName: deviceName, affectedApps: affectedApps)
                 }
             }
+            return true
         }
     }
 
@@ -2682,16 +3624,21 @@ final class AudioEngine {
     }
 
     private func cleanupStaleTaps() {
-        let activePIDs = Set(apps.map { $0.id })
-        let stalePIDs = Set(taps.keys).subtracting(activePIDs)
+        let connectedApps = processMonitor.connectedApps
+        let connectedPIDs = Set(connectedApps.map(\.id))
+        let stalePIDs = Set(taps.keys).subtracting(connectedPIDs)
+        let warmPIDs = Set(stalePIDs.filter { pid in
+            guard let tap = taps[pid], tap.restoresProcessByBundleID else { return false }
+            return shouldRetainRestoringTapWhileAbsent(for: tap.app.persistenceIdentifier)
+        })
 
         // Cancel cleanup for PIDs that reappeared — but only if bundleID matches.
         // PID reuse by a different app should not rescue the old tap.
 
-        for pid in activePIDs {
+        for pid in connectedPIDs {
             guard let task = pendingCleanup[pid] else { continue }
 
-            let reappearedApp = apps.first { $0.id == pid }
+            let reappearedApp = connectedApps.first { $0.id == pid }
             let existingTap = taps[pid]
 
             if let reappearedApp, let existingTap,
@@ -2712,8 +3659,14 @@ final class AudioEngine {
             logger.debug("Cancelled pending cleanup for PID \(pid) - app reappeared")
         }
 
+        // A macOS 26 restoration tap is intentionally useful while its process is absent:
+        // its live aggregate is what intercepts the replacement process at buffer zero.
+        for pid in warmPIDs {
+            pendingCleanup.removeValue(forKey: pid)?.cancel()
+        }
+
         // Schedule cleanup for newly stale PIDs (with grace period)
-        for pid in stalePIDs {
+        for pid in stalePIDs.subtracting(warmPIDs) {
             guard pendingCleanup[pid] == nil else { continue }  // Already pending
 
             pendingCleanup[pid] = Task { @MainActor in
@@ -2721,7 +3674,7 @@ final class AudioEngine {
                 guard !Task.isCancelled else { return }
 
                 // Double-check still stale
-                let currentPIDs = Set(self.apps.map { $0.id })
+                let currentPIDs = Set(self.processMonitor.connectedApps.map(\.id))
                 guard !currentPIDs.contains(pid) else {
                     self.pendingCleanup.removeValue(forKey: pid)
                     return
@@ -2740,7 +3693,9 @@ final class AudioEngine {
         }
 
         // Include pending PIDs in cleanup exclusion to avoid premature state cleanup
-        let pidsToKeep = activePIDs.union(Set(pendingCleanup.keys))
+        let pidsToKeep = connectedPIDs
+            .union(Set(pendingCleanup.keys))
+            .union(warmPIDs)
         appliedPIDs = appliedPIDs.intersection(pidsToKeep)
         followsDefault = followsDefault.intersection(pidsToKeep)
         volumeState.cleanup(keeping: pidsToKeep)
@@ -2873,10 +3828,14 @@ final class AudioEngine {
                     deviceAUTransition(on: tap, to: $0)
                 }
                 try await tap.recreateForOutputRateChange(deviceAUTransition: transition)
+                guard taps.values.contains(where: { $0 === tap }) else { continue }
                 applyDeviceAUChainToTap(tap)
             } catch {
-                logger.error("[RATE] Recreate failed for PID \(pid): \(error.localizedDescription) — falling back to full recreate")
-                await recreateTap(for: pid)
+                guard let currentPID = taps.first(where: { $0.value === tap })?.key else {
+                    continue
+                }
+                logger.error("[RATE] Recreate failed for PID \(currentPID): \(error.localizedDescription) — falling back to full recreate")
+                await recreateTap(for: currentPID)
             }
         }
     }

@@ -7,11 +7,29 @@ import os
 private struct AppFingerprint: Hashable {
     let pid: pid_t
     let objectIDs: [AudioObjectID]
+    let persistenceIdentifier: String
+    let name: String
+    let restorationBundleIDs: [String]
+    let audioProcessBundleIDs: [String]
+    let isHelperBacked: Bool
+    let hasUnresolvedAudioProcessBundleMetadata: Bool
+
+    init(_ app: AudioApp) {
+        pid = app.id
+        objectIDs = app.processObjectIDs
+        persistenceIdentifier = app.persistenceIdentifier
+        name = app.name
+        restorationBundleIDs = app.restorationBundleIDs
+        audioProcessBundleIDs = Array(Set(app.audioProcessBundleIDs)).sorted()
+        isHelperBacked = app.isHelperBacked
+        hasUnresolvedAudioProcessBundleMetadata = app.hasUnresolvedAudioProcessBundleMetadata
+    }
 }
 
 @Observable
 @MainActor
 final class AudioProcessMonitor: AudioProcessMonitoring {
+    private(set) var connectedApps: [AudioApp] = []
     private(set) var activeApps: [AudioApp] = []
     var onAppsChanged: (([AudioApp]) -> Void)?
 
@@ -215,7 +233,6 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
 
             for objectID in processIDs {
                 guard let pid = try? objectID.readProcessPID(), pid != myPID else { continue }
-                guard objectID.readProcessIsRunning() else { continue }
 
                 // Try to find the parent app (for helper processes like Safari Graphics and Media)
                 let directApp = runningAppsByPID[pid]
@@ -234,6 +251,7 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
                     ?? NSImage(systemSymbolName: "app.fill", accessibilityDescription: nil)
                     ?? NSImage()
                 let bundleID = resolvedApp?.bundleIdentifier ?? objectID.readProcessBundleID()
+                let audioProcessBundleID = objectID.readProcessBundleID()
 
                 // Skip system daemons (siri, coreaudio, etc.) - they shouldn't appear in the apps list
                 if isSystemDaemon(bundleID: bundleID, name: name) { continue }
@@ -250,7 +268,14 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
                             name: existing.name,
                             icon: existing.icon,
                             bundleID: existing.bundleID,
-                            isHelperBacked: existing.isHelperBacked || isHelper
+                            isHelperBacked: existing.isHelperBacked || isHelper,
+                            audioProcessBundleIDs: Array(Set(
+                                existing.audioProcessBundleIDs + [audioProcessBundleID].compactMap { $0 }
+                            )).sorted(),
+                            hasUnresolvedAudioProcessBundleMetadata:
+                                existing.hasUnresolvedAudioProcessBundleMetadata
+                                || audioProcessBundleID == nil
+                                || audioProcessBundleID?.isEmpty == true
                         )
                     }
                 } else {
@@ -260,7 +285,10 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
                         name: name,
                         icon: icon,
                         bundleID: bundleID,
-                        isHelperBacked: isHelper
+                        isHelperBacked: isHelper,
+                        audioProcessBundleIDs: [audioProcessBundleID].compactMap { $0 },
+                        hasUnresolvedAudioProcessBundleMetadata:
+                            audioProcessBundleID == nil || audioProcessBundleID?.isEmpty == true
                     )
                 }
             }
@@ -268,14 +296,24 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
             // Update per-process listeners
             updateProcessListeners(for: processIDs)
 
-            let sorted = Self.coalesceLogicalApps(Array(appsByPID.values))
+            let connected = Self.coalesceLogicalApps(Array(appsByPID.values))
+            let active = Self.appsRunningAudio(from: connected) { objectID in
+                objectID.readProcessIsRunning()
+            }
 
-            // Only fire callback if the app list actually changed (avoids churn from periodic refresh)
-            let oldSet = Set(activeApps.map { AppFingerprint(pid: $0.id, objectIDs: $0.processObjectIDs) })
-            let newSet = Set(sorted.map { AppFingerprint(pid: $0.id, objectIDs: $0.processObjectIDs) })
+            // Fire when either lifecycle surface changes. In particular, a newly connected
+            // but not-yet-running process must wake AudioEngine so its saved volume tap can
+            // be armed before the process submits its first output buffer.
+            let lifecycleChanged = Self.lifecycleChanged(
+                oldConnected: connectedApps,
+                oldActive: activeApps,
+                newConnected: connected,
+                newActive: active
+            )
 
-            activeApps = sorted
-            if oldSet != newSet {
+            connectedApps = connected
+            activeApps = active
+            if lifecycleChanged {
                 onAppsChanged?(activeApps)
             }
 
@@ -298,13 +336,42 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
                 name: representative.name,
                 icon: representative.icon,
                 bundleID: representative.bundleID,
-                isHelperBacked: group.contains(where: \.isHelperBacked)
+                isHelperBacked: group.contains(where: \.isHelperBacked),
+                audioProcessBundleIDs: Array(Set(group.flatMap(\.audioProcessBundleIDs))).sorted(),
+                hasUnresolvedAudioProcessBundleMetadata: group.contains(
+                    where: \.hasUnresolvedAudioProcessBundleMetadata
+                )
             )
         }
         .sorted { lhs, rhs in
             let nameOrder = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
             return nameOrder == .orderedSame ? lhs.id < rhs.id : nameOrder == .orderedAscending
         }
+    }
+
+    /// Keeps the UI's historical "active" meaning separate from HAL connection state.
+    /// A logical app is active when any of its (possibly helper-backed) process objects
+    /// reports audio IO in progress.
+    nonisolated static func appsRunningAudio(
+        from connectedApps: [AudioApp],
+        isRunning: (AudioObjectID) -> Bool
+    ) -> [AudioApp] {
+        connectedApps.filter { app in
+            app.processObjectIDs.contains(where: isRunning)
+        }
+    }
+
+    /// Process metadata can settle after Core Audio publishes the object. Treat bundle,
+    /// helper, and display identity changes as lifecycle changes even when PID/object IDs
+    /// are stable so AudioEngine can rebuild an under-specified restoring tap.
+    nonisolated static func lifecycleChanged(
+        oldConnected: [AudioApp],
+        oldActive: [AudioApp],
+        newConnected: [AudioApp],
+        newActive: [AudioApp]
+    ) -> Bool {
+        Set(oldConnected.map(AppFingerprint.init)) != Set(newConnected.map(AppFingerprint.init))
+            || Set(oldActive.map(AppFingerprint.init)) != Set(newActive.map(AppFingerprint.init))
     }
 
     private func updateProcessListeners(for processIDs: [AudioObjectID]) {

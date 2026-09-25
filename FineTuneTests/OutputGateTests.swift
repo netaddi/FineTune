@@ -212,6 +212,143 @@ struct OutputGateRampingTests {
     }
 }
 
+@Suite("OutputGate — sample-continuous envelope")
+struct OutputGateEnvelopeTests {
+    @Test("A callback gap rearms the gate and discards the stale louder gain")
+    func resumeAfterNoCallbacksSeedsCurrentGain() {
+        var last: UInt64 = 100
+        var phase: UInt8 = 2
+        var progress: Float = 1
+        var silent: Int32 = 0
+        var currentVolume: Float = 1
+        ProcessTapController.prepareOutputGateForCallback(
+            now: 900_100, previousHostTime: &last, restartAfterTicks: 200,
+            targetVolume: 0.1, currentVolume: &currentVolume,
+            phase: &phase, progress: &progress, silentSamples: &silent
+        )
+        #expect(last == 900_100)
+        #expect(phase == 0)
+        #expect(progress == 0)
+        #expect(currentVolume == 0.1)
+        let first = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase, progress: &progress, silentSamples: &silent,
+            maxPeak: 1, frameCount: 512, rampSamples: 1_920,
+            silenceHoldSamples: 9_600
+        )
+        #expect(first == .muted)
+    }
+
+    @Test("Normal callback cadence preserves the active volume ramp")
+    func continuousCallbacksKeepSmoothing() {
+        var last: UInt64 = 100
+        var phase: UInt8 = 2
+        var progress: Float = 1
+        var silent: Int32 = 0
+        var currentVolume: Float = 0.8
+        ProcessTapController.prepareOutputGateForCallback(
+            now: 110, previousHostTime: &last, restartAfterTicks: 200,
+            targetVolume: 0.1, currentVolume: &currentVolume,
+            phase: &phase, progress: &progress, silentSamples: &silent
+        )
+        #expect(phase == 2)
+        #expect(currentVolume == 0.8)
+    }
+
+    @Test("A gate rearmed by silent buffers also starts from the current limited gain")
+    func continuousSilenceSeedsCurrentGain() {
+        var last: UInt64 = 100
+        var phase: UInt8 = 0
+        var progress: Float = 1
+        var silent: Int32 = 0
+        var currentVolume: Float = 1
+        ProcessTapController.prepareOutputGateForCallback(
+            now: 110, previousHostTime: &last, restartAfterTicks: 200,
+            targetVolume: 0.05, currentVolume: &currentVolume,
+            phase: &phase, progress: &progress, silentSamples: &silent
+        )
+        #expect(currentVolume == 0.05)
+        #expect(phase == 0)
+    }
+
+    @Test("A buffer larger than the whole ramp starts at zero and opens only after the ramp frames")
+    func oversizedBufferDoesNotJumpToUnity() {
+        var phase: UInt8 = 0
+        var progress: Float = 0
+        var silent: Int32 = 0
+
+        // The trigger buffer remains muted and arms the ramp.
+        _ = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silent,
+            maxPeak: aboveThreshold,
+            frameCount: 4_096,
+            rampSamples: defaultRampSamples,
+            silenceHoldSamples: defaultSilenceHold
+        )
+
+        let envelope = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silent,
+            maxPeak: aboveThreshold,
+            frameCount: 4_096,
+            rampSamples: defaultRampSamples,
+            silenceHoldSamples: defaultSilenceHold
+        )
+
+        #expect(envelope.start == 0)
+        #expect(envelope.end == 1)
+        #expect(envelope.rampFrameCount == 1_920)
+        #expect(ProcessTapController.outputGateMultiplier(for: envelope, frame: 0) == 0)
+        #expect(ProcessTapController.outputGateMultiplier(for: envelope, frame: 1) > 0)
+        #expect(ProcessTapController.outputGateMultiplier(for: envelope, frame: 1_919) < 1)
+        #expect(ProcessTapController.outputGateMultiplier(for: envelope, frame: 1_920) == 1)
+    }
+
+    @Test("Adjacent HAL buffers differ by at most one interpolated sample step")
+    func bufferBoundaryIsContinuous() {
+        var phase: UInt8 = 0
+        var progress: Float = 0
+        var silent: Int32 = 0
+
+        _ = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silent,
+            maxPeak: aboveThreshold,
+            frameCount: 512,
+            rampSamples: defaultRampSamples,
+            silenceHoldSamples: defaultSilenceHold
+        )
+        let first = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silent,
+            maxPeak: aboveThreshold,
+            frameCount: 512,
+            rampSamples: defaultRampSamples,
+            silenceHoldSamples: defaultSilenceHold
+        )
+        let second = ProcessTapController.advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silent,
+            maxPeak: aboveThreshold,
+            frameCount: 512,
+            rampSamples: defaultRampSamples,
+            silenceHoldSamples: defaultSilenceHold
+        )
+
+        let lastFirst = ProcessTapController.outputGateMultiplier(for: first, frame: 511)
+        let firstSecond = ProcessTapController.outputGateMultiplier(for: second, frame: 0)
+        let firstSampleStep = (first.end - first.start) / Float(first.rampFrameCount)
+        #expect(abs(firstSecond - first.end) < 1e-6)
+        #expect(firstSecond >= lastFirst)
+        #expect(firstSecond - lastFirst <= firstSampleStep + 1e-6)
+    }
+}
+
 // MARK: - Open phase
 
 @Suite("OutputGate — open phase (2)")

@@ -4,6 +4,18 @@ import Darwin
 import Foundation
 import os
 
+/// Per-buffer description of the cold-start output gate. The endpoints are computed
+/// with the half-cosine curve once per callback; the render loop linearly interpolates
+/// between them so a large HAL buffer cannot turn the whole buffer on at one gain step.
+struct OutputGateEnvelope: Equatable {
+    let start: Float
+    let end: Float
+    let rampFrameCount: Int
+
+    static let muted = OutputGateEnvelope(start: 0, end: 0, rampFrameCount: 0)
+    static let open = OutputGateEnvelope(start: 1, end: 1, rampFrameCount: 0)
+}
+
 // MARK: - Threading Model
 //
 // ProcessTapController bridges two execution domains:
@@ -25,7 +37,9 @@ import os
 @MainActor
 final class ProcessTapController: ProcessTapControlling {
     nonisolated private static let appProcessingFrameCapacity = 4096
-    let app: AudioApp
+    private(set) var app: AudioApp
+    private(set) var restoresProcessByBundleID = false
+    private(set) var configuredRestorationBundleIDs: Set<String> = []
     private let logger: Logger
     // Note: This queue is passed to AudioDeviceCreateIOProcIDWithBlock but the actual
     // audio callback runs on CoreAudio's real-time HAL I/O thread, not this queue.
@@ -126,6 +140,11 @@ final class ProcessTapController: ProcessTapControlling {
     private nonisolated(unsafe) var _outputGateRawPhase: UInt8 = 0
     private nonisolated(unsafe) var _outputGateProgress: Float = 0
     private nonisolated(unsafe) var _outputGateSilentSamples: Int32 = 0
+    /// Only the primary producer touches this timestamp. A driver may stop callbacks
+    /// altogether while paused, so counting silent frames alone cannot detect a resume.
+    private nonisolated(unsafe) var _primaryLastGateHostTime: UInt64 = 0
+    /// Computed on MainActor before starting I/O; no lazy timebase initialization in RT.
+    private nonisolated(unsafe) var _outputGateRestartHostTicks: UInt64 = 0
     /// Sample count for the 40 ms half-cosine ramp (recomputed in activate from device rate).
     private nonisolated(unsafe) var _outputGateRampSamples: Float = 1920
     /// Sample count for the 200 ms silence-hold before re-arming (recomputed in activate).
@@ -174,6 +193,7 @@ final class ProcessTapController: ProcessTapControlling {
     /// Main-actor retry used when an outgoing tap is still rendering the persistent AU
     /// during a PID or device handoff. It never runs on the HAL thread.
     private var appAUReconfigureTask: Task<Void, Never>?
+    private var deviceAUReconfigureTask: Task<Void, Never>?
     /// One stereo work buffer per concurrently active IOProc lets stateful processing run
     /// once before fan-out without allowing primary/secondary HAL callbacks to race over
     /// the same memory during a device crossfade. Allocated at init only.
@@ -312,6 +332,15 @@ final class ProcessTapController: ProcessTapControlling {
 
     // MARK: - Public Methods
 
+    /// Updates PID/process metadata after Core Audio has restored this tap by bundle ID.
+    /// The HAL graph and all RT processing state deliberately stay untouched: callbacks
+    /// may still be running for the live aggregate, and the saved gain has already been
+    /// applied continuously while the process was absent.
+    func rebind(to app: AudioApp) {
+        guard app.persistenceIdentifier == self.app.persistenceIdentifier else { return }
+        self.app = app
+    }
+
     func updateEQSettings(_ settings: EQSettings) {
         eqProcessor?.updateSettings(settings)
         secondaryEQProcessor?.updateSettings(settings)
@@ -412,9 +441,9 @@ final class ProcessTapController: ProcessTapControlling {
         appAUReconfigureTask?.cancel()
         appAUReconfigureTask = nil
         _currentAUEntries = entries
-        let sampleRate = primaryAggregateSampleRate ?? 48_000
+        let sampleRate = primaryAggregateSampleRate
         var needsRateRetry = false
-        if let chain {
+        if let chain, let sampleRate {
             needsRateRetry = !chain.reconfigure(sampleRate: sampleRate)
         }
         let old = auEffectChain
@@ -430,7 +459,7 @@ final class ProcessTapController: ProcessTapControlling {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { _ = old }
         }
 
-        if needsRateRetry, let chain {
+        if needsRateRetry, let chain, let sampleRate {
             scheduleAppAURateRetry(chain, sampleRate: sampleRate)
         }
     }
@@ -517,6 +546,8 @@ final class ProcessTapController: ProcessTapControlling {
         explicitPresetEntryID: UUID?,
         preservingLiveStateFor liveStateHost: AUEffectHost? = nil
     ) {
+        deviceAUReconfigureTask?.cancel()
+        deviceAUReconfigureTask = nil
         if explicitPresetEntryID == nil,
            entries == _currentDeviceAUEntries,
            (entries.isEmpty ? deviceAUEffectChain == nil : deviceAUEffectChain != nil) {
@@ -573,6 +604,27 @@ final class ProcessTapController: ProcessTapControlling {
         let maxTail = max(appTail, deviceTail)
         let sampleRate = primaryAggregateSampleRate ?? 48_000
         _maxTailSamples = UInt64(maxTail * sampleRate)
+    }
+
+    private func scheduleDeviceAURateRetry(_ chain: AUEffectChain, sampleRate: Double) {
+        deviceAUReconfigureTask?.cancel()
+        deviceAUReconfigureTask = Task { @MainActor [weak self, weak chain] in
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(10))
+                guard !Task.isCancelled,
+                      let self,
+                      let chain,
+                      self.deviceAUEffectChain === chain else { return }
+                if chain.reconfigure(sampleRate: sampleRate) {
+                    self.updateMaxTailTime()
+                    self.deviceAUReconfigureTask = nil
+                    return
+                }
+            }
+            guard !Task.isCancelled else { return }
+            self?.logger.warning("Device AU rate reconfiguration remained busy at \(sampleRate)Hz")
+            self?.deviceAUReconfigureTask = nil
+        }
     }
 
     // MARK: - Multi-Device Aggregate Configuration
@@ -872,6 +924,29 @@ final class ProcessTapController: ProcessTapControlling {
         logger.info("Stereo EQ/AU processing will use the preferred L/R pair for tap format with \(asbd.mChannelsPerFrame) channels; other channels pass through.")
     }
 
+    /// On macOS 26, let Core Audio remember the tapped bundle(s) and attach this live
+    /// graph to a replacement process before that process begins playback. This closes
+    /// the otherwise unavoidable process-discovery window where audio reaches hardware
+    /// at unity gain before FineTune can construct a new aggregate.
+    private func configureProcessRestoration(_ description: CATapDescription) {
+        guard #available(macOS 26.0, *) else { return }
+        guard app.supportsSafeProcessRestoration else {
+            // The explicit process-object list is still authoritative for this live tap,
+            // but HAL must not persist a shared or unresolved helper as a future bundle
+            // match. A bundle-only standby is installed after the unsafe live tap exits.
+            description.isProcessRestoreEnabled = false
+            restoresProcessByBundleID = false
+            configuredRestorationBundleIDs.removeAll()
+            return
+        }
+        let bundleIDs = configuredRestorationBundleIDs.union(app.restorationBundleIDs)
+        guard !bundleIDs.isEmpty else { return }
+        description.bundleIDs = bundleIDs.sorted()
+        description.isProcessRestoreEnabled = true
+        configuredRestorationBundleIDs = bundleIDs
+        restoresProcessByBundleID = true
+    }
+
     /// Creates a process tap, preferring a device-stream tap to preserve multichannel routing.
     /// Falls back to stereo mixdown if stream-specific tap creation fails.
     private func createProcessTap(preferredDeviceUID: String?) throws -> (description: CATapDescription, tapID: AudioObjectID) {
@@ -883,6 +958,7 @@ final class ProcessTapController: ProcessTapControlling {
                 streamTap.uuid = UUID()
                 streamTap.muteBehavior = .mutedWhenTapped
                 streamTap.isPrivate = true
+                configureProcessRestoration(streamTap)
 
                 var tapID: AudioObjectID = .unknown
                 let err = AudioHardwareCreateProcessTap(streamTap, &tapID)
@@ -903,6 +979,7 @@ final class ProcessTapController: ProcessTapControlling {
         mixdownTap.uuid = UUID()
         mixdownTap.muteBehavior = .mutedWhenTapped
         mixdownTap.isPrivate = true
+        configureProcessRestoration(mixdownTap)
 
         var mixdownTapID: AudioObjectID = .unknown
         let mixdownErr = AudioHardwareCreateProcessTap(mixdownTap, &mixdownTapID)
@@ -1008,6 +1085,23 @@ final class ProcessTapController: ProcessTapControlling {
         }
         _lastLoudnessVolume = initial.loudnessVolume
 
+        // AudioEngine attaches persisted app/device chains before activation. Reconfigure
+        // those already-published instances to the aggregate's actual rate while no IOProc
+        // can render them, closing the post-AudioDeviceStart dry-processing window.
+        appAUReconfigureTask?.cancel()
+        appAUReconfigureTask = nil
+        if let auEffectChain, !auEffectChain.reconfigure(sampleRate: sampleRate) {
+            logger.error("App AU chain could not be prepared at \(sampleRate) Hz; chain remains fail-safe bypassed")
+            scheduleAppAURateRetry(auEffectChain, sampleRate: sampleRate)
+        }
+        deviceAUReconfigureTask?.cancel()
+        deviceAUReconfigureTask = nil
+        if let deviceAUEffectChain, !deviceAUEffectChain.reconfigure(sampleRate: sampleRate) {
+            logger.error("Device AU chain could not be prepared at \(sampleRate) Hz; chain remains fail-safe bypassed")
+            scheduleDeviceAURateRetry(deviceAUEffectChain, sampleRate: sampleRate)
+        }
+        updateMaxTailTime()
+
         // Create IO proc with gain processing
         nextCallbackID += 1
         _primaryCallbackID = nextCallbackID
@@ -1038,6 +1132,8 @@ final class ProcessTapController: ProcessTapControlling {
         _outputGateRawPhase = 0
         _outputGateProgress = 0
         _outputGateSilentSamples = 0
+        _primaryLastGateHostTime = 0
+        _outputGateRestartHostTicks = UInt64(200_000_000 / Self.hostTimeNanosScale)
         _outputGateRampSamples = Float(sampleRate) * 0.040
         _outputGateSilenceHoldSamples = Int32(sampleRate * 0.200)
 
@@ -1329,6 +1425,10 @@ final class ProcessTapController: ProcessTapControlling {
 
         crossfadeTask?.cancel()
         crossfadeTask = nil
+        appAUReconfigureTask?.cancel()
+        appAUReconfigureTask = nil
+        deviceAUReconfigureTask?.cancel()
+        deviceAUReconfigureTask = nil
 
         logger.debug("Invalidating tap for \(self.app.name)")
 
@@ -1908,6 +2008,11 @@ final class ProcessTapController: ProcessTapControlling {
         // The old callback is force-silenced but its resources still exist. Reconfigure
         // the persistent app instances now, while a failure can still abandon the new
         // aggregate and resume the old device at its original sample rate.
+        // A retry left over from activation or a previous rollback targets the old rate.
+        // Cancel it before touching the same persistent chain; otherwise it can wake while
+        // this switch is settling and silently put the live AU back on the old format.
+        appAUReconfigureTask?.cancel()
+        appAUReconfigureTask = nil
         let appChain = auEffectChain
         let previousAppAUSampleRate = appChain?.sampleRate
         if let appChain, !appChain.reconfigure(sampleRate: deviceSampleRate) {
@@ -2033,15 +2138,39 @@ final class ProcessTapController: ProcessTapControlling {
         return (min(maxPeak, 1), firstBufferFrameCount)
     }
 
-    /// Advance the output-gate state machine for one buffer and return the multiplier
-    /// to apply to this buffer's output. Pure function; no class state. RT-safe:
-    /// no allocations, no locks, no Foundation. One `cos` per buffer (not per sample).
+    /// Restart after an actual callback gap as well as after counted silent input. Seed
+    /// the current gain whenever the gate is armed so a volume reduction made while
+    /// paused cannot resume at the old loud gain and take 30 ms to decay. Pure RT-safe
+    /// integer/float operations; callers supply host ticks with a precomputed threshold.
+    @inline(__always)
+    nonisolated static func prepareOutputGateForCallback(
+        now: UInt64,
+        previousHostTime: inout UInt64,
+        restartAfterTicks: UInt64,
+        targetVolume: Float,
+        currentVolume: inout Float,
+        phase: inout UInt8,
+        progress: inout Float,
+        silentSamples: inout Int32
+    ) {
+        if previousHostTime == 0 || now &- previousHostTime >= restartAfterTicks {
+            phase = 0
+            progress = 0
+            silentSamples = 0
+        }
+        previousHostTime = now
+        if phase == 0 { currentVolume = targetVolume }
+    }
+
+    /// Advance the output-gate state machine for one buffer and return its gain envelope.
+    /// Pure function; no class state. RT-safe: no allocations, locks, or Foundation.
+    /// At most two `cos` calls are made per buffer; the render loop interpolates samples.
     ///
     /// Phase encoding: 0 armed (muted), 1 ramping (half-cosine fade-in), 2 open.
     /// Transitions: armed→ramping on first non-silent buffer; ramping→open at progress≥1.
     /// open→armed after `silenceHoldSamples` of sustained silence (re-arm next wake).
     @inline(__always)
-    nonisolated static func advanceOutputGate(
+    nonisolated static func advanceOutputGateEnvelope(
         phase: inout UInt8,
         progress: inout Float,
         silentSamples: inout Int32,
@@ -2049,7 +2178,7 @@ final class ProcessTapController: ProcessTapControlling {
         frameCount: Int,
         rampSamples: Float,
         silenceHoldSamples: Int32
-    ) -> Float {
+    ) -> OutputGateEnvelope {
         let isSilent = maxPeak <= outputGateSilenceThreshold
         switch phase {
         case 0:  // armed — wait for non-silent input
@@ -2058,15 +2187,39 @@ final class ProcessTapController: ProcessTapControlling {
                 progress = 0
                 silentSamples = 0
             }
-            return 0
+            // Keep the trigger buffer silent. The next callback begins at exactly zero
+            // and ramps sample-by-sample; no buffer boundary can jump to a coarse step.
+            return .muted
         case 1:  // ramping — half-cosine fade-in
-            progress = min(1.0, progress + Float(frameCount) / rampSamples)
-            if progress >= 1.0 {
+            let safeRampSamples = max(rampSamples, 1)
+            let startProgress = min(max(progress, 0), 1)
+            if startProgress >= 1 {
                 phase = 2
                 silentSamples = 0
-                return 1.0
+                progress = 1
+                return .open
             }
-            return 0.5 * (1 - cos(.pi * progress))
+            let startMultiplier = 0.5 * (1 - cos(.pi * startProgress))
+            let positiveFrameCount = max(frameCount, 0)
+            let remainingRampFrames = Int(ceil((1 - startProgress) * safeRampSamples))
+            let rampFrameCount = min(positiveFrameCount, max(remainingRampFrames, 0))
+            let endProgress = min(
+                1,
+                startProgress + Float(positiveFrameCount) / safeRampSamples
+            )
+            let endMultiplier = endProgress >= 1
+                ? 1
+                : 0.5 * (1 - cos(.pi * endProgress))
+            progress = endProgress
+            if endProgress >= 1 {
+                phase = 2
+                silentSamples = 0
+            }
+            return OutputGateEnvelope(
+                start: startMultiplier,
+                end: endMultiplier,
+                rampFrameCount: rampFrameCount
+            )
         case 2:  // open — passthrough; track sustained silence for re-arm
             if isSilent {
                 silentSamples = silentSamples &+ Int32(frameCount)
@@ -2077,10 +2230,47 @@ final class ProcessTapController: ProcessTapControlling {
             } else {
                 silentSamples = 0
             }
-            return 1.0
+            return .open
         default:
-            return 1.0  // defensive; should be unreachable
+            return .open  // defensive; should be unreachable
         }
+    }
+
+    /// Backward-compatible endpoint helper retained for state-machine unit tests.
+    @inline(__always)
+    nonisolated static func advanceOutputGate(
+        phase: inout UInt8,
+        progress: inout Float,
+        silentSamples: inout Int32,
+        maxPeak: Float,
+        frameCount: Int,
+        rampSamples: Float,
+        silenceHoldSamples: Int32
+    ) -> Float {
+        advanceOutputGateEnvelope(
+            phase: &phase,
+            progress: &progress,
+            silentSamples: &silentSamples,
+            maxPeak: maxPeak,
+            frameCount: frameCount,
+            rampSamples: rampSamples,
+            silenceHoldSamples: silenceHoldSamples
+        ).end
+    }
+
+    /// Returns the per-frame gain represented by an envelope without trigonometry in the
+    /// inner render loop. `frame == rampFrameCount` reaches `end`; adjacent buffers share
+    /// the same endpoint, limiting every boundary change to one ordinary sample step.
+    @inline(__always)
+    nonisolated static func outputGateMultiplier(
+        for envelope: OutputGateEnvelope,
+        frame: Int
+    ) -> Float {
+        guard envelope.rampFrameCount > 0, frame < envelope.rampFrameCount else {
+            return envelope.end
+        }
+        let fraction = Float(max(frame, 0)) / Float(envelope.rampFrameCount)
+        return envelope.start + (envelope.end - envelope.start) * fraction
     }
 
     @inline(__always)
@@ -2090,6 +2280,8 @@ final class ProcessTapController: ProcessTapControlling {
         targetVol: Float,
         crossfadeMultiplier: Float,
         outputGateMultiplier: Float,
+        outputGateStartMultiplier: Float? = nil,
+        outputGateRampFrameCount: Int = 0,
         rampCoefficient: Float,
         inputStereoLeft: Int,
         inputStereoRight: Int,
@@ -2106,6 +2298,11 @@ final class ProcessTapController: ProcessTapControlling {
         appProcessingFrameCapacity: Int = 0
     ) {
         let inputBufferCount = inputBuffers.count
+        let outputGateEnvelope = OutputGateEnvelope(
+            start: outputGateStartMultiplier ?? outputGateMultiplier,
+            end: outputGateMultiplier,
+            rampFrameCount: outputGateRampFrameCount
+        )
         let outputBufferCount = outputBuffers.count
 
         // All processors below represent one logical stream in this controller. Build one
@@ -2162,7 +2359,11 @@ final class ProcessTapController: ProcessTapControlling {
                         }
                         for frame in 0..<sharedProcessingFrameCount {
                             currentVol += (targetVol - currentVol) * rampCoefficient
-                            let gain = currentVol * crossfadeMultiplier * outputGateMultiplier
+                            let gate = Self.outputGateMultiplier(
+                                for: outputGateEnvelope,
+                                frame: frame
+                            )
+                            let gain = currentVol * crossfadeMultiplier * gate
                             let inputBase = frame * inputChannels
                             let stereoBase = frame * 2
                             appProcessingScratch[stereoBase] = inputSamples[inputBase + sourceLeft] * gain
@@ -2280,7 +2481,11 @@ final class ProcessTapController: ProcessTapControlling {
                 var replayVolume = sharedProcessingInitialVolume
                 for frame in 0..<frameCount {
                     replayVolume += (targetVol - replayVolume) * rampCoefficient
-                    let gain = replayVolume * crossfadeMultiplier * outputGateMultiplier
+                    let gate = Self.outputGateMultiplier(
+                        for: outputGateEnvelope,
+                        frame: frame
+                    )
+                    let gain = replayVolume * crossfadeMultiplier * gate
                     let inputBase = frame * inputChannels
                     let outputBase = frame * outputChannels
                     let copiedChannels = min(inputChannels, outputChannels)
@@ -2306,9 +2511,13 @@ final class ProcessTapController: ProcessTapControlling {
                     if !usesSharedProcessingBlock {
                         currentVol += (targetVol - currentVol) * rampCoefficient
                     }
+                    let gate = Self.outputGateMultiplier(
+                        for: outputGateEnvelope,
+                        frame: frame
+                    )
                     let gain = usesSharedProcessingBlock
                         ? 1
-                        : currentVol * crossfadeMultiplier * outputGateMultiplier
+                        : currentVol * crossfadeMultiplier * gate
                     let base = frame * inputChannels
                     for ch in 0..<inputChannels {
                         outputSamples[base + ch] = inputSamples[base + ch] * gain
@@ -2322,9 +2531,13 @@ final class ProcessTapController: ProcessTapControlling {
                     if !usesSharedProcessingBlock {
                         currentVol += (targetVol - currentVol) * rampCoefficient
                     }
+                    let gate = Self.outputGateMultiplier(
+                        for: outputGateEnvelope,
+                        frame: frame
+                    )
                     let gain = usesSharedProcessingBlock
                         ? 1
-                        : currentVol * crossfadeMultiplier * outputGateMultiplier
+                        : currentVol * crossfadeMultiplier * gate
                     let inBase = frame * 2
                     let outBase = frame * outputChannels
                     let left = inputSamples[inBase] * gain
@@ -2345,9 +2558,13 @@ final class ProcessTapController: ProcessTapControlling {
                     if !usesSharedProcessingBlock {
                         currentVol += (targetVol - currentVol) * rampCoefficient
                     }
+                    let gate = Self.outputGateMultiplier(
+                        for: outputGateEnvelope,
+                        frame: frame
+                    )
                     let gain = usesSharedProcessingBlock
                         ? 1
-                        : currentVol * crossfadeMultiplier * outputGateMultiplier
+                        : currentVol * crossfadeMultiplier * gate
                     let sample = inputSamples[frame] * gain
                     let outBase = frame * outputChannels
 
@@ -2366,9 +2583,13 @@ final class ProcessTapController: ProcessTapControlling {
                     if !usesSharedProcessingBlock {
                         currentVol += (targetVol - currentVol) * rampCoefficient
                     }
+                    let gate = Self.outputGateMultiplier(
+                        for: outputGateEnvelope,
+                        frame: frame
+                    )
                     let gain = usesSharedProcessingBlock
                         ? 1
-                        : currentVol * crossfadeMultiplier * outputGateMultiplier
+                        : currentVol * crossfadeMultiplier * gate
                     let inBase = frame * inputChannels
                     let outBase = frame * outputChannels
                     let copiedChannels = min(inputChannels, outputChannels)
@@ -2553,10 +2774,20 @@ final class ProcessTapController: ProcessTapControlling {
         // the silence hold, so unmute after a long mute still gets a fade-in.
         // _forceSilence is left to the destructive-switch path, which always pairs with
         // a fresh activate(initial:) and so resets gate state.
-        let outputGateMultiplier: Float
+        let outputGateEnvelope: OutputGateEnvelope
         if isPrimary {
+            Self.prepareOutputGateForCallback(
+                now: mach_absolute_time(),
+                previousHostTime: &_primaryLastGateHostTime,
+                restartAfterTicks: _outputGateRestartHostTicks,
+                targetVolume: _volume,
+                currentVolume: &_primaryCurrentVolume,
+                phase: &_outputGateRawPhase,
+                progress: &_outputGateProgress,
+                silentSamples: &_outputGateSilentSamples
+            )
             let gateInputPeak: Float = _isMuted ? 0.0 : rawPeak
-            outputGateMultiplier = Self.advanceOutputGate(
+            outputGateEnvelope = Self.advanceOutputGateEnvelope(
                 phase: &_outputGateRawPhase,
                 progress: &_outputGateProgress,
                 silentSamples: &_outputGateSilentSamples,
@@ -2567,7 +2798,7 @@ final class ProcessTapController: ProcessTapControlling {
             )
         } else {
             // Secondary tap fades in via crossfadeState; skip the gate to avoid double-attenuation.
-            outputGateMultiplier = 1.0
+            outputGateEnvelope = .open
         }
 
         // AU tail time: track silent input to allow reverb/delay tails to fade naturally
@@ -2676,7 +2907,9 @@ final class ProcessTapController: ProcessTapControlling {
             outputBuffers: outputBuffers,
             targetVol: targetVol,
             crossfadeMultiplier: crossfadeMultiplier,
-            outputGateMultiplier: outputGateMultiplier,
+            outputGateMultiplier: outputGateEnvelope.end,
+            outputGateStartMultiplier: outputGateEnvelope.start,
+            outputGateRampFrameCount: outputGateEnvelope.rampFrameCount,
             rampCoefficient: rampCoeff,
             inputStereoLeft: inputStereoLeft,
             inputStereoRight: inputStereoRight,

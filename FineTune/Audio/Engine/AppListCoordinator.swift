@@ -19,7 +19,8 @@ final class AppListCoordinator {
         let info = PinnedAppInfo(
             persistenceIdentifier: app.persistenceIdentifier,
             displayName: app.name,
-            bundleID: app.bundleID
+            bundleID: app.bundleID,
+            restorationBundleIDs: app.restorationBundleIDs
         )
         settingsManager.pinApp(app.persistenceIdentifier, info: info)
     }

@@ -46,6 +46,9 @@ struct AudioTab: View {
         .onChange(of: settings.appSettings.loudnessEqualizationEnabled) { _, newValue in
             audioEngine.setLoudnessEqualizationEnabled(newValue)
         }
+        .onChange(of: settings.appSettings.defaultNewAppVolume) { _, _ in
+            audioEngine.defaultNewAppVolumeDidChange()
+        }
     }
 
     // MARK: - Volume

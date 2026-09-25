@@ -197,9 +197,23 @@ final class MockDeviceVolumeProviding: DeviceVolumeProviding {
         return autoDetectedTiersByID[deviceID] ?? defaultTier
     }
 
+    func outputProcessingGain(for deviceID: AudioDeviceID) -> Float {
+        DeviceVolumeMonitor.processingGain(
+            backend: outputVolumeBackend(for: deviceID),
+            volume: volumes[deviceID] ?? 1,
+            muted: muteStates[deviceID] ?? false
+        )
+    }
+
     var applyTierOverrideChangeCalls: [AudioDeviceID] = []
     func applyTierOverrideChange(for deviceID: AudioDeviceID) {
         applyTierOverrideChangeCalls.append(deviceID)
+        if let volume = volumes[deviceID] {
+            onVolumeChanged?(deviceID, volume)
+        }
+        if let muted = muteStates[deviceID] {
+            onMuteChanged?(deviceID, muted)
+        }
     }
 
     func start() {}

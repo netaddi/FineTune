@@ -44,6 +44,21 @@ struct PinnedAppInfo: Codable, Equatable {
     let persistenceIdentifier: String
     let displayName: String
     let bundleID: String?
+    /// Safe bundle identities learned from this app's Core Audio clients. Optional keeps
+    /// settings written by earlier FineTune versions source-compatible.
+    let restorationBundleIDs: [String]?
+
+    init(
+        persistenceIdentifier: String,
+        displayName: String,
+        bundleID: String?,
+        restorationBundleIDs: [String]? = nil
+    ) {
+        self.persistenceIdentifier = persistenceIdentifier
+        self.displayName = displayName
+        self.bundleID = bundleID
+        self.restorationBundleIDs = restorationBundleIDs
+    }
 }
 
 // MARK: - Ignored App Info
@@ -548,6 +563,30 @@ final class SettingsManager {
         settings.pinnedApps.insert(identifier)
         settings.pinnedAppInfo[identifier] = info
         reconcileMixerStripSlots()
+        scheduleSave()
+    }
+
+    /// Refreshes helper bundle identities without changing pin order or mixer slots.
+    /// Writes only when the normalized value changes because process-list callbacks can
+    /// call this repeatedly while an app starts its helper processes.
+    func updatePinnedAppRestorationBundleIDs(_ identifier: String, bundleIDs: [String]) {
+        guard let current = settings.pinnedAppInfo[identifier] else { return }
+        guard let baseBundleID = current.bundleID, !baseBundleID.isEmpty else { return }
+        let isSafeIdentity: (String) -> Bool = {
+            $0 == baseBundleID || $0.hasPrefix(baseBundleID + ".")
+        }
+        // HAL helper objects may appear and disappear independently. Once a helper in the
+        // app's own namespace has been learned, retain it so a later absent-process startup
+        // does not silently regress to a base-bundle-only tap.
+        let learned = (current.restorationBundleIDs ?? []) + bundleIDs + [baseBundleID]
+        let normalized = Array(Set(learned.filter(isSafeIdentity))).sorted()
+        guard current.restorationBundleIDs != normalized else { return }
+        settings.pinnedAppInfo[identifier] = PinnedAppInfo(
+            persistenceIdentifier: current.persistenceIdentifier,
+            displayName: current.displayName,
+            bundleID: current.bundleID,
+            restorationBundleIDs: normalized
+        )
         scheduleSave()
     }
 

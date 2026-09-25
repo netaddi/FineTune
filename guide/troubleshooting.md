@@ -43,6 +43,16 @@ There are two cases.
 
 Auto-detection gets it right for most devices, but some USB DACs and HDMI/DisplayPort outputs advertise a hardware slider that doesn't actually move the output level. If the device slider doesn't change the volume, open the device inspector (the info button on the device row) and turn on **Software volume**. FineTune remembers the choice per device. The toggle is hidden when auto-detect already picked Software, because there's no alternative backend to switch to.
 
+## Brief loud burst when an app starts or resumes after a long pause
+
+For an app whose volume must be limited from its first buffer, let it play once, set its volume, and **pin the app** in edit mode. Keep FineTune running before starting playback. On macOS 26 or later, FineTune keeps a bundle-restoring tap active even while a pinned app is completely closed. Its saved gain, mute and AU chain are installed before the graph starts; the first non-silent output is gated and then opens through a sample-interpolated 40 ms ramp.
+
+Pausing is not the same as quitting. Earlier builds removed the tap after about 30 seconds without playback, leaving a direct-output window when playback resumed. FineTune now retains the graph while the Core Audio client remains connected, including long pauses. If a driver stops callbacks entirely, a gap of 200 ms or longer re-arms the soft start and seeds the current saved gain, so lowering volume while paused cannot resume at the old louder gain.
+
+FineTune also keeps a tap warm for a connected but idle audio client when it has saved processing or routing. It learns dedicated helper bundle IDs that belong to the same app namespace; shared system helpers are deliberately excluded so unrelated audio is never captured.
+
+On macOS 15–25, Core Audio cannot restore a process tap for an app that does not exist yet. FineTune still retains and pre-arms connected idle clients, but a completely cold process may emit before its process object becomes discoverable. Shared system helpers or incomplete bundle metadata also require an explicit process tap; automatic bundle restoration is intentionally disabled for those live graphs to avoid capturing another app. Pinning on macOS 26+ gives the strongest protection for known app-specific bundles, but is not a system-wide limiter before FineTune starts or if tap creation fails. If a pinned app still bursts, verify the installed build, the pin/ignore state, and capture permission, then report the app and output device.
+
 ## Audio device not switching automatically
 
 FineTune uses a **device priority list** to decide which output device to use. When a device connects, FineTune only switches to it if it's ranked higher than the current device. When a device disconnects, FineTune falls back to the next highest-priority device that's still connected.

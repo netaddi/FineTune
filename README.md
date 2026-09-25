@@ -53,7 +53,7 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 ### 🎚 Volume Control
 - **Per-app volume** — Individual sliders and mute for each application
 - **Per-app volume boost** — 2x / 3x / 4x gain presets
-- **Pinned apps** — Keep apps visible in the menu bar even when they're not playing, so you can configure volume, EQ, and routing in advance
+- **Pinned apps and pause protection** — Keep apps visible when they're not playing and configure volume, EQ, and routing in advance. Connected audio clients keep their processing graph through long pauses; resuming after a callback gap reloads the current gain and opens through a sample-interpolated 40 ms ramp. On macOS 26+, pinned apps also get a bundle-restoring standby graph while closed, with gain, mute, routing and AU state loaded before activation. App-specific helpers are supported; shared or unresolved helper identities require explicit capture. Keep FineTune running before playback and see the [startup/resume notes](guide/troubleshooting.md#brief-loud-burst-when-an-app-starts-or-resumes-after-a-long-pause) for OS and lifecycle limitations
 - **Ignore apps** — Completely disengage FineTune from specific apps. Tears down the audio tap so the app returns to normal macOS audio
 - **Scroll-wheel volume** — Hover any slider in the popup, the HUD, or the EQ panel and scroll to adjust.
 
