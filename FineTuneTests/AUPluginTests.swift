@@ -841,7 +841,9 @@ struct AUEffectChainTests {
         let audioUnit = try #require(host.audioUnit)
         let entryID = UUID()
         let counter = LiveChangeCounter()
-        let manager = AUPluginWindowManager.shared
+        // Concurrent engine-reset tests legitimately close the shared manager. This
+        // parameter-listener test owns an isolated manager instead of racing that UI.
+        let manager = AUPluginWindowManager()
         #expect(manager.installLiveChangeListenerForTesting(
             entryID: entryID,
             audioUnit: audioUnit
@@ -853,7 +855,11 @@ struct AUEffectChainTests {
         }
 
         #expect(manager.notifyFirstObservableParameterForTesting(audioUnit))
-        try await Task.sleep(for: .milliseconds(700))
+        // Full-suite AU instantiation can delay the main-queue listener. Wait for
+        // its observable result with a deadline rather than assuming a 700 ms slot.
+        for _ in 0..<60 where counter.value == 0 {
+            try await Task.sleep(for: .milliseconds(50))
+        }
 
         #expect(counter.value == 1)
     }

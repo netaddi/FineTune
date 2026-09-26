@@ -22,6 +22,28 @@ final class AudioEngine {
     #endif
 
     private var taps: [pid_t: any ProcessTapControlling] = [:]
+    private let audioServiceMonitor = AudioServiceMonitor()
+    private var serviceRecoveryTask: Task<Void, Never>?
+    private var serviceRecoveryGeneration: UInt64 = 0
+    private var retiredServiceTaps: [any ProcessTapControlling] = []
+    private(set) var isRecoveringAudioService = false
+    private(set) var audioServiceRecoveryError: String?
+    private var tapHealthMisses: [pid_t: Int] = [:]
+    private var healthTickCount = 0
+    private var serviceEpoch = AudioServiceGeneration.current
+    private var isRunning = true
+    private var pendingHandoffs: Set<ObjectIdentifier> = []
+    private var recreatingTaps: [pid_t: any ProcessTapControlling] = [:]
+    // Short, injectable timings keep failure-path tests deterministic without HAL resets.
+    var serviceRecoveryRetryDelays: [Duration] = [.zero, .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2), .seconds(4)]
+    var serviceRecoveryDrainPolls = 100
+    private var canProvisionAudio: Bool {
+        isRunning && !isRecoveringAudioService && serviceEpoch == AudioServiceGeneration.current
+    }
+    private func hasRetiringProducer(for identifier: String) -> Bool {
+        recreatingTaps.values.contains { $0.app.persistenceIdentifier == identifier }
+            || retiredServiceTaps.contains { $0.app.persistenceIdentifier == identifier }
+    }
 
     // MARK: - Observable AU State (authoritative for SwiftUI)
     //
@@ -308,6 +330,7 @@ final class AudioEngine {
 
         // Wire callbacks — needed for both test and production mode
         wireCallbacks()
+        audioServiceMonitor.onRestart = { [weak self] in self?.handleAudioServiceRestart() }
 
         #if !APP_STORE
         // DDC availability can change after display re-probes, independently of HAL's
@@ -323,7 +346,10 @@ final class AudioEngine {
         #endif
 
         if startMonitorsAutomatically {
+            audioServiceMonitor.start()
+            let generation = serviceRecoveryGeneration
             Task { @MainActor in
+                guard self.serviceRecoveryGeneration == generation, self.canProvisionAudio else { return }
                 if self.permission.status == .authorized {
                     self.processMonitor.start()
                 }
@@ -339,6 +365,7 @@ final class AudioEngine {
 
                 self.applyPersistedSettings()
                 self.preparePinnedColdStartTaps()
+                self.startHealthMonitor()
                 self.registerNewDevicesInPriority()
                 // Seed the confirmed default from whatever macOS has at startup
                 self.lastConfirmedDefaultUID = self.deviceVolumeMonitor.defaultDeviceUID
@@ -839,6 +866,12 @@ final class AudioEngine {
     }
 
     func start() {
+        isRunning = true
+        audioServiceMonitor.start()
+        if serviceEpoch != AudioServiceGeneration.current || !retiredServiceTaps.isEmpty {
+            handleAudioServiceRestart()
+            return
+        }
         // Monitors have internal guards against double-starting
         if permission.status == .authorized {
             processMonitor.start()
@@ -846,9 +879,7 @@ final class AudioEngine {
         deviceMonitor.start()
         applyPersistedSettings()
         preparePinnedColdStartTaps()
-        if permission.status == .authorized {
-            startHealthMonitor()
-        }
+        startHealthMonitor()
 
         // Restore locked input device if feature is enabled
         if settingsManager.appSettings.lockInputDevice {
@@ -859,6 +890,12 @@ final class AudioEngine {
     }
 
     func stop() {
+        isRunning = false
+        audioServiceMonitor.stop()
+        serviceRecoveryGeneration &+= 1
+        serviceRecoveryTask?.cancel()
+        serviceRecoveryTask = nil
+        isRecoveringAudioService = false
         stopHealthMonitor()
         for task in routeRetryTasks.values { task.cancel() }
         routeRetryTasks.removeAll()
@@ -872,11 +909,178 @@ final class AudioEngine {
         coldStartRetryAttempts.removeAll()
         processMonitor.stop()
         deviceMonitor.stop()
-        for tap in taps.values {
-            tap.invalidate()
+        for (pid, tap) in taps {
+            recreatingTaps[pid] = tap
+            Task { @MainActor [weak self] in
+                await tap.invalidateAsync()
+                guard let self, self.recreatingTaps[pid] === tap else { return }
+                self.recreatingTaps.removeValue(forKey: pid)
+                if self.canProvisionAudio { self.applyPersistedSettings(); self.preparePinnedColdStartTaps() }
+            }
         }
         taps.removeAll()
+        appliedPIDs.removeAll()
+        cancelPendingAudioWork()
         logger.info("AudioEngine stopped")
+    }
+
+    // MARK: - Core Audio service recovery
+
+    /// A restarted HAL owns a new namespace, even when PIDs and numeric object IDs
+    /// look unchanged. Preserve logical mixer strips, not the old server resources.
+    func handleAudioServiceRestart() {
+        guard isRunning else { return }
+        serviceRecoveryGeneration &+= 1
+        let generation = serviceRecoveryGeneration
+        serviceEpoch = AudioServiceGeneration.current
+        serviceRecoveryTask?.cancel()
+        isRecoveringAudioService = true
+        audioServiceRecoveryError = nil
+        stopHealthMonitor()
+        cancelPendingAudioWork()
+        for tap in Array(taps.values) + Array(recreatingTaps.values) {
+            tap.retireAfterServiceRestart()
+            if !retiredServiceTaps.contains(where: { $0 === tap }) {
+                retiredServiceTaps.append(tap)
+            }
+        }
+        taps.removeAll()
+        pendingHandoffs.removeAll()
+        recreatingTaps.removeAll()
+        appliedPIDs.removeAll()
+        appDeviceRouting.removeAll()
+        followsDefault.removeAll()
+        tapRecoveryCooldownUntil.removeAll()
+        tapHealthMisses.removeAll()
+        outputEchoTracker.reset()
+        inputEchoTracker.reset()
+        lastConfirmedDefaultUID = nil
+        lastAutoSwitchOverrideTime = nil
+        // These cached IDs and every property listener belong to the old server.
+        processMonitor.resetAfterServiceRestart()
+        deviceVolumeMonitor.resetAfterServiceRestart()
+        deviceMonitor.resetAfterServiceRestart()
+
+        serviceRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for _ in 0..<self.serviceRecoveryDrainPolls {
+                if self.retiredServiceTaps.allSatisfy(\.serviceRestartCallbacksDrained) { break }
+                do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
+                guard self.serviceRecoveryGeneration == generation else { return }
+            }
+            guard !Task.isCancelled, self.serviceRecoveryGeneration == generation else { return }
+            guard self.retiredServiceTaps.allSatisfy(\.serviceRestartCallbacksDrained) else {
+                self.finishAudioServiceRecoveryFailure("An old audio callback did not stop. Restart FineTune before resuming playback.")
+                return
+            }
+            self.retiredServiceTaps.removeAll()
+            for delay in self.serviceRecoveryRetryDelays {
+                do { try await Task.sleep(for: delay) } catch { return }
+                guard self.serviceRecoveryGeneration == generation else { return }
+                guard self.serviceEpoch == AudioServiceGeneration.current else {
+                    self.handleAudioServiceRestart()
+                    return
+                }
+                // A failed registration can leave successful child listeners behind.
+                // Reset the entire monitor lifecycle before retrying, not just start().
+                self.deviceMonitor.resetAfterServiceRestart()
+                self.deviceVolumeMonitor.resetAfterServiceRestart()
+                self.processMonitor.resetAfterServiceRestart()
+                self.deviceMonitor.start()
+                self.deviceVolumeMonitor.start()
+                if self.permission.status == .authorized { self.processMonitor.start() }
+                guard self.deviceMonitor.isMonitoringReady, self.deviceVolumeMonitor.isMonitoringReady,
+                      self.permission.status != .authorized || self.processMonitor.isMonitoringReady else { continue }
+                guard let uid = self.deviceVolumeMonitor.defaultDeviceUID,
+                      self.deviceMonitor.device(for: uid) != nil else { continue }
+                guard self.serviceRecoveryGeneration == generation else { return }
+                guard self.serviceEpoch == AudioServiceGeneration.current else {
+                    self.handleAudioServiceRestart()
+                    return
+                }
+                self.lastConfirmedDefaultUID = uid
+                self.isRecoveringAudioService = false
+                self.applyPersistedSettings()
+                self.preparePinnedColdStartTaps()
+                let needed = self.requiredCaptureIdentifiers()
+                let captured = Set(self.taps.values.map { $0.app.persistenceIdentifier })
+                if self.permission.status == .authorized && !needed.isSubset(of: captured) {
+                    self.audioServiceRecoveryError = "Some audio capture graphs are unavailable. Recovery will retry; volume protection may be incomplete."
+                }
+                self.registerNewDevicesInPriority()
+                self.startHealthMonitor()
+                self.serviceRecoveryTask = nil
+                self.logger.notice("Core Audio monitors recovered; rebuilt \(self.taps.count) capture graphs, missing \(needed.subtracting(captured).count)")
+                return
+            }
+            self.finishAudioServiceRecoveryFailure("Core Audio output is not ready. Pause playback and retry audio recovery.")
+        }
+    }
+
+    private func finishAudioServiceRecoveryFailure(_ message: String) {
+        audioServiceRecoveryError = message
+        serviceRecoveryTask = nil
+        // Keep provisioning closed: a stuck callback must never share its AU with a
+        // replacement producer. No software tap can attenuate audio while HAL is down.
+        logger.error("Audio service recovery failed: \(message, privacy: .public)")
+    }
+
+    private func cancelPendingAudioWork() {
+        staleCleanupTask?.cancel()
+        staleCleanupTask = nil
+        for task in pendingCleanup.values { task.cancel() }
+        pendingCleanup.removeAll()
+        for task in routeRetryTasks.values { task.cancel() }
+        routeRetryTasks.removeAll()
+        routeRetryAttempts.removeAll()
+        for task in routeReconcileTasks.values { task.cancel() }
+        routeReconcileTasks.removeAll()
+        routeIntentRevisions.removeAll()
+        routeIntentPlans.removeAll()
+        for task in coldStartRetryTasks.values { task.cancel() }
+        coldStartRetryTasks.removeAll()
+        coldStartRetryAttempts.removeAll()
+        if case .pendingAutoSwitch(_, let task) = outputPriorityState { task.cancel() }
+        if case .pendingAutoSwitch(_, let task) = inputPriorityState { task.cancel() }
+        outputPriorityState = .stable
+        inputPriorityState = .stable
+        for id in Array(aliveWatchers.keys) { removeAliveWatcher(id) }
+    }
+
+    private func activateTap(_ tap: any ProcessTapControlling, initial: TapInitialState) throws {
+        let epoch = AudioServiceGeneration.current
+        try tap.activate(initial: initial)
+        guard epoch == AudioServiceGeneration.current, canProvisionAudio else {
+            tap.retireAfterServiceRestart()
+            retiredServiceTaps.append(tap)
+            throw CancellationError()
+        }
+    }
+
+    private func retireForHandoff(_ tap: any ProcessTapControlling) -> Bool {
+        let identity = ObjectIdentifier(tap)
+        guard tap.invalidateForHandoff() else {
+            pendingHandoffs.insert(identity)
+            audioServiceRecoveryError = "An audio graph is still shutting down. Playback protection may be unavailable; FineTune will retry."
+            return false
+        }
+        pendingHandoffs.remove(identity)
+        return true
+    }
+
+    private func requiredCaptureIdentifiers() -> Set<String> {
+        var identifiers = Set(appsForTapProvisioning.filter {
+            !settingsManager.isIgnored($0.persistenceIdentifier)
+        }.map(\.persistenceIdentifier))
+        if coldStartPrearmingEnabled && bundleProcessRestorationAvailable {
+            for info in settingsManager.getPinnedAppInfo() {
+                guard let bundleID = info.bundleID, !bundleID.isEmpty,
+                      !settingsManager.isIgnored(info.persistenceIdentifier),
+                      inactiveDevicePlan(for: info.persistenceIdentifier) != nil else { continue }
+                identifiers.insert(info.persistenceIdentifier)
+            }
+        }
+        return identifiers
     }
 
     /// Explicit shutdown for app termination. Ensures all listeners are cleaned up.
@@ -895,6 +1099,9 @@ final class AudioEngine {
     /// Keeping the taps alive until `_exit` also keeps every AU render refcon and scratch
     /// buffer valid after the IOProcs have been joined.
     func prepareForProcessExit() {
+        audioServiceMonitor.stop()
+        serviceRecoveryGeneration &+= 1
+        serviceRecoveryTask?.cancel()
         stopHealthMonitor()
         for task in routeRetryTasks.values { task.cancel() }
         for task in routeReconcileTasks.values { task.cancel() }
@@ -1144,6 +1351,7 @@ final class AudioEngine {
     /// creation plus persistent ownership gives each pinned app a stable track identity.
     private func preparePersistentMixerStrips() {
         for info in settingsManager.getPinnedAppInfo() {
+            guard !hasRetiringProducer(for: info.persistenceIdentifier) else { continue }
             preparePersistentMixerStrip(
                 identifier: info.persistenceIdentifier,
                 displayName: info.displayName
@@ -1932,8 +2140,8 @@ final class AudioEngine {
         revision: UInt64,
         tap: any ProcessTapControlling
     ) -> Bool {
-        guard currentRouteIntent(for: identifier) == revision,
-              taps.values.contains(where: { $0 === tap }) else {
+        guard canProvisionAudio, taps.values.contains(where: { $0 === tap }) else { return false }
+        guard currentRouteIntent(for: identifier) == revision else {
             scheduleRouteReconciliation(for: identifier)
             return false
         }
@@ -1941,6 +2149,7 @@ final class AudioEngine {
     }
 
     private func scheduleRouteReconciliation(for identifier: String) {
+        guard canProvisionAudio else { return }
         guard routeReconcileTasks[identifier] == nil else { return }
         routeReconcileTasks[identifier] = Task { @MainActor [weak self] in
             // Coalesce multiple stale completions from the same burst of route changes.
@@ -1952,6 +2161,7 @@ final class AudioEngine {
     }
 
     private func scheduleRouteRetry(for identifier: String) {
+        guard canProvisionAudio else { return }
         guard routeRetryTasks[identifier] == nil else { return }
         let attempt = (routeRetryAttempts[identifier] ?? 0) + 1
         guard attempt <= 3 else {
@@ -1973,6 +2183,7 @@ final class AudioEngine {
     }
 
     private func refreshInactiveTapRouting(identifier: String) {
+        guard canProvisionAudio else { return }
         guard let (pid, tap) = taps.first(where: {
             $0.value.app.persistenceIdentifier == identifier
         }) else { return }
@@ -2097,6 +2308,7 @@ final class AudioEngine {
     }
 
     private func preparePinnedColdStartTaps() {
+        guard canProvisionAudio else { return }
         guard coldStartPrearmingEnabled,
               bundleProcessRestorationAvailable,
               permission.status == .authorized else { return }
@@ -2104,6 +2316,7 @@ final class AudioEngine {
         let connectedPIDs = Set(processMonitor.connectedApps.map(\.id))
 
         for info in settingsManager.getPinnedAppInfo() {
+            guard !hasRetiringProducer(for: info.persistenceIdentifier) else { continue }
             guard let bundleID = info.bundleID, !bundleID.isEmpty else {
                 clearColdStartRetry(for: info.persistenceIdentifier)
                 continue
@@ -2122,7 +2335,8 @@ final class AudioEngine {
             }
             for pid in exitedUnsafePIDs {
                 pendingCleanup.removeValue(forKey: pid)?.cancel()
-                taps.removeValue(forKey: pid)?.invalidateForHandoff()
+                if let old = taps[pid], !retireForHandoff(old) { continue }
+                taps.removeValue(forKey: pid)
                 appDeviceRouting.removeValue(forKey: pid)
                 followsDefault.remove(pid)
                 appliedPIDs.remove(pid)
@@ -2183,7 +2397,7 @@ final class AudioEngine {
                     primaryDeviceUID: plan.uids[0],
                     deviceVolume: tap.currentDeviceVolume
                 )
-                try tap.activate(initial: initial)
+                try activateTap(tap, initial: initial)
                 guard tap.restoresProcessByBundleID else {
                     tap.invalidate()
                     volumeState.removeVolume(for: standbyPID)
@@ -2584,12 +2798,13 @@ final class AudioEngine {
 
     /// Creates a tap with the specified device UIDs
     private func ensureTapWithDevices(for app: AudioApp, deviceUIDs: [String]) {
+        guard canProvisionAudio, !hasRetiringProducer(for: app.persistenceIdentifier) else { return }
         guard !deviceUIDs.isEmpty else { return }
         let provisioningApp = appWithPersistedRestorationIdentity(app)
         _ = adoptRestoringTap(for: provisioningApp)
         guard taps[provisioningApp.id] == nil else { return }
         guard permission.status == .authorized else { return }
-        retireOtherTaps(for: provisioningApp)
+        guard retireOtherTaps(for: provisioningApp) else { return }
 
         let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(provisioningApp.id))
         do {
@@ -2604,7 +2819,7 @@ final class AudioEngine {
                 primaryDeviceUID: deviceUIDs[0],
                 deviceVolume: tap.currentDeviceVolume
             )
-            try tap.activate(initial: initial)
+            try activateTap(tap, initial: initial)
             taps[provisioningApp.id] = tap
             appDeviceRouting[provisioningApp.id] = deviceUIDs[0]
 
@@ -2623,6 +2838,7 @@ final class AudioEngine {
     }
 
     func applyPersistedSettings() {
+        guard canProvisionAudio else { return }
         guard permission.status == .authorized else { return }
         for app in processMonitor.connectedApps
         where settingsManager.isPinned(app.persistenceIdentifier) {
@@ -2681,7 +2897,7 @@ final class AudioEngine {
                     // live description setter can block indefinitely on an active tap, so use
                     // the bounded synchronous producer handoff for membership or identity
                     // changes. This also handles metadata settling on a stable object ID.
-                    existing.invalidateForHandoff()
+                    guard retireForHandoff(existing) else { continue }
                     taps.removeValue(forKey: app.id)
                     appliedPIDs.remove(app.id)
                 } else if existing.app.name != app.name
@@ -2839,11 +3055,12 @@ final class AudioEngine {
     }
 
     private func ensureTapExists(for app: AudioApp, deviceUID: String) {
+        guard canProvisionAudio, !hasRetiringProducer(for: app.persistenceIdentifier) else { return }
         let provisioningApp = appWithPersistedRestorationIdentity(app)
         _ = adoptRestoringTap(for: provisioningApp)
         guard taps[provisioningApp.id] == nil else { return }
         guard permission.status == .authorized else { return }
-        retireOtherTaps(for: provisioningApp)
+        guard retireOtherTaps(for: provisioningApp) else { return }
 
         let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(provisioningApp.id))
         do {
@@ -2859,7 +3076,7 @@ final class AudioEngine {
                 primaryDeviceUID: deviceUID,
                 deviceVolume: tap.currentDeviceVolume
             )
-            try tap.activate(initial: initial)
+            try activateTap(tap, initial: initial)
             taps[provisioningApp.id] = tap
 
             // Catalog AutoEQ may not have been cached yet — kick off async resolve.
@@ -2880,7 +3097,7 @@ final class AudioEngine {
     /// Enforces one live HAL producer for each persistent mixer strip. Teardown joins the
     /// old IOProc before the replacement is created, so no old callback can overlap the
     /// new tap through one stateful Console 1 instance.
-    private func retireOtherTaps(for app: AudioApp) {
+    private func retireOtherTaps(for app: AudioApp) -> Bool {
         let incomingObjectIDs = Set(app.processObjectIDs)
         let oldPIDs = taps.compactMap { pid, tap in
             let sharesProcessObject = !incomingObjectIDs.isEmpty
@@ -2892,13 +3109,15 @@ final class AudioEngine {
         }
         for pid in oldPIDs {
             pendingCleanup.removeValue(forKey: pid)?.cancel()
-            if let oldTap = taps.removeValue(forKey: pid) {
-                oldTap.invalidateForHandoff()
+            if let oldTap = taps[pid] {
+                guard retireForHandoff(oldTap) else { return false }
+                taps.removeValue(forKey: pid)
             }
             appDeviceRouting.removeValue(forKey: pid)
             followsDefault.remove(pid)
             appliedPIDs.remove(pid)
         }
+        return true
     }
 
     /// Restores the default to `lastConfirmedDefaultUID` (what the user/FineTune intended).
@@ -3040,6 +3259,7 @@ final class AudioEngine {
 
     /// Called when device disappears - updates routing and switches taps immediately
     private func handleDeviceDisconnected(_ deviceUID: String, name deviceName: String) {
+        guard canProvisionAudio else { return }
         // Clean up alive watcher — use UID lookup since device is already removed from monitor
         removeAliveWatcher(forUID: deviceUID)
 
@@ -3220,6 +3440,7 @@ final class AudioEngine {
 
     /// Called when a device appears - switches pinned apps back to their preferred device
     private func handleDeviceConnected(_ deviceUID: String, name deviceName: String) {
+        guard canProvisionAudio else { return }
         // Register newly connected device in priority list
         settingsManager.ensureDeviceInPriority(deviceUID)
 
@@ -3492,6 +3713,7 @@ final class AudioEngine {
     /// Called when system default output device changes - switches apps that follow default
     @discardableResult
     private func handleDefaultDeviceChanged(_ newDefaultUID: String) -> Bool {
+        guard canProvisionAudio else { return false }
         // State machine: if we're waiting for macOS to auto-switch after a device connect,
         // check whether this change is the expected auto-switch or user intent.
         if case .pendingAutoSwitch(let pendingUID, let timeoutTask) = outputPriorityState {
@@ -3624,6 +3846,7 @@ final class AudioEngine {
     }
 
     private func cleanupStaleTaps() {
+        guard canProvisionAudio else { return }
         let connectedApps = processMonitor.connectedApps
         let connectedPIDs = Set(connectedApps.map(\.id))
         let stalePIDs = Set(taps.keys).subtracting(connectedPIDs)
@@ -3703,6 +3926,7 @@ final class AudioEngine {
 
     /// Debounced stale tap cleanup — coalesces rapid app-list changes into a single cleanup pass.
     private func scheduleStaleCleanup() {
+        guard canProvisionAudio else { return }
         staleCleanupTask?.cancel()
         staleCleanupTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
@@ -3718,74 +3942,111 @@ final class AudioEngine {
     private func startHealthMonitor() {
         guard healthMonitorTask == nil else { return }
         healthMonitorTask = Task { @MainActor [weak self] in
-            var consecutiveMisses: [pid_t: Int] = [:]
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
-
-                // Skip entirely when no taps exist — avoids unnecessary work at idle (#176)
-                guard !self.taps.isEmpty else { continue }
-
-                let now = Date()
-
-                for (pid, tap) in self.taps {
-                    // Skip muted apps — no callbacks while muted isn't a health signal
-                    guard !tap.isMuted else { continue }
-
-                    // Skip PIDs in recovery cooldown to prevent recreation thrashing
-                    if let cooldownEnd = self.tapRecoveryCooldownUntil[pid], now < cooldownEnd {
-                        continue
-                    }
-
-                    guard tap.isHealthCheckEligible(minActiveSeconds: 5.0) else { continue }
-
-                    // Only health-check apps that are actively streaming (isRunning=true).
-                    // Paused apps have no callbacks, which is normal — not a health signal.
-                    let isActivelyStreaming = self.processMonitor.activeApps.contains { $0.id == pid }
-                    guard isActivelyStreaming else {
-                        consecutiveMisses[pid] = 0
-                        continue
-                    }
-
-                    if tap.hasRecentAudioCallback(within: 3.0) {
-                        consecutiveMisses[pid] = 0
-                    } else {
-                        let misses = (consecutiveMisses[pid] ?? 0) + 1
-                        consecutiveMisses[pid] = misses
-
-                        if misses >= 3 {
-                            self.logger.warning("Tap for PID \(pid) unresponsive (\(misses) misses), recreating")
-                            consecutiveMisses[pid] = 0
-                            await self.recreateTap(for: pid)
-                        }
-                    }
-                }
-
-                // Prune entries for PIDs no longer tracked
-                consecutiveMisses = consecutiveMisses.filter { self.taps[$0.key] != nil }
-                self.tapRecoveryCooldownUntil = self.tapRecoveryCooldownUntil.filter { self.taps[$0.key] != nil }
+                await self.checkTapHealth()
             }
+        }
+    }
+
+    /// Also handles a graph which never delivered its first callback. Input-only and
+    /// paused processes are not evidence of missing output; misses must be consecutive.
+    func checkTapHealth() async {
+        guard isRunning else { return }
+        if serviceEpoch != AudioServiceGeneration.current {
+            handleAudioServiceRestart()
+            return
+        }
+        guard canProvisionAudio else { return }
+        if !deviceMonitor.isMonitoringReady { deviceMonitor.start() }
+        if !deviceVolumeMonitor.isMonitoringReady { deviceVolumeMonitor.start() }
+        if permission.status == .authorized && !processMonitor.isMonitoringReady { processMonitor.start() }
+        healthTickCount += 1
+        if healthTickCount.isMultiple(of: 5) {
+            deviceMonitor.repairChildListeners()
+            deviceVolumeMonitor.repairChildListeners()
+        }
+        guard permission.status == .authorized else { return }
+        let generation = serviceRecoveryGeneration
+        let outputPIDs = Set(processMonitor.activeOutputApps.map(\.id))
+        for (pid, tap) in taps {
+            guard generation == serviceRecoveryGeneration, canProvisionAudio else { return }
+            guard taps[pid] === tap else { continue }
+            guard !tap.isAudioResourceTransitionInProgress else {
+                tapHealthMisses[pid] = 0
+                continue
+            }
+            if pendingHandoffs.contains(ObjectIdentifier(tap)) {
+                if retireForHandoff(tap) {
+                    taps.removeValue(forKey: pid)
+                    appliedPIDs.remove(pid)
+                }
+                continue
+            }
+            let inCooldown = (tapRecoveryCooldownUntil[pid] ?? .distantPast) > Date()
+            guard !inCooldown else { tapHealthMisses[pid] = 0; continue }
+            if !tap.hasValidAudioResources {
+                logger.warning("Tap for PID \(pid) lost its HAL identity; rebuilding")
+                await recreateTap(for: pid)
+                continue
+            }
+            guard !tap.isMuted, outputPIDs.contains(pid),
+                  tap.isHealthCheckEligible(minActiveSeconds: 5.0),
+                  !tap.hasRecentAudioCallback(within: 3.0) else {
+                tapHealthMisses[pid] = 0
+                continue
+            }
+            tapHealthMisses[pid, default: 0] += 1
+            if tapHealthMisses[pid, default: 0] >= 3 {
+                tapHealthMisses[pid] = 0
+                logger.warning("Output tap for PID \(pid) has no callbacks; rebuilding")
+                await recreateTap(for: pid)
+            }
+        }
+        tapHealthMisses = tapHealthMisses.filter { taps[$0.key] != nil }
+        tapRecoveryCooldownUntil = tapRecoveryCooldownUntil.filter { taps[$0.key] != nil }
+        // A temporary creation failure after HAL recovery must not require another
+        // process-list event. Reconcile missing graphs without touching healthy ones.
+        applyPersistedSettings()
+        preparePinnedColdStartTaps()
+        let needed = requiredCaptureIdentifiers()
+        let missing = needed.subtracting(Set(taps.values.map { $0.app.persistenceIdentifier }))
+        if !missing.isEmpty {
+            audioServiceRecoveryError = "Some audio capture graphs are unavailable. Recovery will retry; volume protection may be incomplete."
+        } else if pendingHandoffs.isEmpty {
+            audioServiceRecoveryError = nil
         }
     }
 
     private func stopHealthMonitor() {
         healthMonitorTask?.cancel()
         healthMonitorTask = nil
+        tapHealthMisses.removeAll()
     }
 
     /// Tears down and recreates a tap for a given PID, preserving routing and settings.
     /// Async: awaits full CoreAudio resource teardown before creating the replacement tap
     /// to prevent orphaned IO procs from accumulating (issue #176).
     private func recreateTap(for pid: pid_t) async {
+        guard canProvisionAudio else { return }
+        let generation = serviceRecoveryGeneration
         guard let oldTap = taps.removeValue(forKey: pid) else { return }
         let deviceUIDs = oldTap.currentDeviceUIDs
+        recreatingTaps[pid] = oldTap
+        defer {
+            if recreatingTaps[pid] === oldTap { recreatingTaps.removeValue(forKey: pid) }
+        }
         await oldTap.invalidateAsync()
+        guard generation == serviceRecoveryGeneration, canProvisionAudio else { return }
+        recreatingTaps.removeValue(forKey: pid)
 
         // Set cooldown to prevent thrashing
         tapRecoveryCooldownUntil[pid] = Date().addingTimeInterval(20)
 
         // Find the current AudioApp entry for this PID
-        guard let app = apps.first(where: { $0.id == pid }) else {
+        guard let app = processMonitor.connectedApps.first(where: { $0.id == pid }),
+              app.persistenceIdentifier == oldTap.app.persistenceIdentifier else {
             logger.debug("No active app for PID \(pid), skipping tap recreation")
             appliedPIDs.remove(pid)
             return
@@ -3819,6 +4080,7 @@ final class AudioEngine {
     /// sample rate (A2DP↔SCO), so each tap's IOProc re-rates to match. Falls back to a full tap
     /// recreate if the in-controller recreation throws.
     private func handleBTDeviceSampleRateChanged(uid: String, newRate: Double) async {
+        guard canProvisionAudio else { return }
         logger.info("[RATE] BT output \(uid, privacy: .public) → \(newRate, format: .fixed(precision: 0)) Hz — recreating affected taps (clean dip)")
         let affected = taps.filter { $0.value.currentDeviceUIDs.contains(uid) }
         for (pid, tap) in affected {
@@ -3845,6 +4107,7 @@ final class AudioEngine {
     /// Handles changes to the default input device.
     /// Uses state machine to distinguish auto-switch (from device connection) vs user action.
     private func handleDefaultInputDeviceChanged(_ newDefaultInputUID: String) {
+        guard canProvisionAudio else { return }
         // State machine: if we're waiting for macOS to auto-switch after input device connect,
         // check whether this change is the expected auto-switch or user intent.
         if case .pendingAutoSwitch(let pendingUID, let timeoutTask) = inputPriorityState {
@@ -3971,6 +4234,7 @@ final class AudioEngine {
 
     /// Called when an input device connects — restores locked/preferred device and guards against auto-switch.
     private func handleInputDeviceConnected(_ deviceUID: String, name deviceName: String) {
+        guard canProvisionAudio else { return }
         guard settingsManager.appSettings.lockInputDevice else { return }
 
         // If the reconnected device is the user's preferred device, restore the lock to it
@@ -4012,6 +4276,7 @@ final class AudioEngine {
 
     /// Handles input device disconnect — uses priority fallback, then built-in mic.
     private func handleInputDeviceDisconnected(_ deviceUID: String) {
+        guard canProvisionAudio else { return }
         // If we were waiting for macOS to auto-switch to this device, cancel — it's gone
         if case .pendingAutoSwitch(let uid, let task) = inputPriorityState, uid == deviceUID {
             task.cancel()

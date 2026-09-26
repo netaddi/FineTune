@@ -127,6 +127,20 @@ struct MenuBarPopupView: View {
             }
             .padding(.bottom, DesignTokens.Spacing.xs)
 
+            if audioEngine.isRecoveringAudioService || audioEngine.audioServiceRecoveryError != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(audioEngine.audioServiceRecoveryError ?? "Reconnecting to Core Audio…")
+                        .font(.caption)
+                    Text("Volume protection is unavailable until capture resumes.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if audioEngine.isRecoveringAudioService && audioEngine.audioServiceRecoveryError != nil {
+                        Button("Retry audio recovery") { audioEngine.handleAudioServiceRestart() }
+                    }
+                }
+                .padding(8)
+                .background(.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     mainContent(scrollProxy: proxy)

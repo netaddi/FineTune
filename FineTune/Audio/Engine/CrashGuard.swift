@@ -88,6 +88,17 @@ private nonisolated let logger = Logger(subsystem: "com.finetuneapp.FineTune", c
 /// Uses a fixed-size C buffer (not Swift collections) so the signal handler
 /// only touches async-signal-safe memory.
 nonisolated enum CrashGuard {
+    /// Numeric object IDs belong to the old server, not to similarly numbered objects
+    /// in its replacement. Keep plugin tracking, but never destroy those stale devices.
+    static func forgetDevicesAfterServiceRestart() {
+        os_unfair_lock_lock(&gDeviceLock)
+        defer { os_unfair_lock_unlock(&gDeviceLock) }
+        if let slots = gDeviceSlots {
+            slots.update(repeating: AudioObjectID(kAudioObjectUnknown), count: gMaxDeviceSlots)
+        }
+        gDeviceCount = 0
+    }
+
     /// Allocates the tracking buffer and installs crash signal handlers.
     /// Call once on app startup, before creating any taps.
     static func install() {

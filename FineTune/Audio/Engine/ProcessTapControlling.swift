@@ -32,8 +32,15 @@ protocol ProcessTapControlling: AnyObject, Sendable {
     func invalidate()
     /// Blocking teardown used only when another producer will immediately inherit the
     /// same persistent stateful AU instances.
-    func invalidateForHandoff()
+    @discardableResult func invalidateForHandoff() -> Bool
     func invalidateAsync() async
+    /// Close the local callback gate and forget server-owned objects after a HAL reset.
+    /// Does not join a possibly blocked HAL call on MainActor or destroy stale IDs.
+    func retireAfterServiceRestart()
+    var serviceRestartCallbacksDrained: Bool { get }
+    /// Read-only identity check on the control plane, independent of audio activity.
+    var hasValidAudioResources: Bool { get }
+    var isAudioResourceTransitionInProgress: Bool { get }
     func updateEQSettings(_ settings: EQSettings)
     func updateAutoEQProfile(_ profile: AutoEQProfile?)
     func setAutoEQPreampEnabled(_ enabled: Bool)
@@ -61,6 +68,10 @@ protocol ProcessTapControlling: AnyObject, Sendable {
 }
 
 extension ProcessTapControlling {
+    func retireAfterServiceRestart() { invalidate() }
+    var serviceRestartCallbacksDrained: Bool { true }
+    var hasValidAudioResources: Bool { true }
+    var isAudioResourceTransitionInProgress: Bool { false }
     var restoresProcessByBundleID: Bool { false }
     var configuredRestorationBundleIDs: Set<String> { [] }
 
@@ -97,8 +108,9 @@ extension ProcessTapControlling {
         invalidate()
     }
 
-    func invalidateForHandoff() {
+    @discardableResult func invalidateForHandoff() -> Bool {
         invalidate()
+        return true
     }
 
     func refreshTapSource(_ preferredDeviceUID: String?) async throws {

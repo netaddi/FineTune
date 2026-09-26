@@ -220,7 +220,10 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     func start() {
-        guard defaultDeviceListenerBlock == nil else { return }
+        guard !isMonitoringReady else { return }
+        stop()
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
 
         logger.debug("Starting device volume monitor")
 
@@ -239,6 +242,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         // Listen for default output device changes
         defaultDeviceListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleDefaultDeviceChanged()
             }
         }
@@ -251,12 +255,14 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         )
 
         if defaultDeviceStatus != noErr {
+            defaultDeviceListenerBlock = nil
             logger.error("Failed to add default device listener: \(defaultDeviceStatus)")
         }
 
         // Listen for system output device changes
         systemDeviceListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleSystemDeviceChanged()
             }
         }
@@ -269,6 +275,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         )
 
         if systemDeviceStatus != noErr {
+            systemDeviceListenerBlock = nil
             logger.error("Failed to add system device listener: \(systemDeviceStatus)")
         }
 
@@ -282,6 +289,7 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         // Listen for default input device changes
         defaultInputDeviceListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleDefaultInputDeviceChanged()
             }
         }
@@ -294,10 +302,19 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         )
 
         if defaultInputDeviceStatus != noErr {
+            defaultInputDeviceListenerBlock = nil
             logger.error("Failed to add default input device listener: \(defaultInputDeviceStatus)")
         }
 
         startObservingInputDeviceList()
+
+        // A default may change between the initial read and listener registration.
+        // Snapshot again only after all subscriptions are installed.
+        refreshDefaultDevice()
+        refreshSystemDevice()
+        refreshDefaultInputDevice()
+        refreshDeviceListeners()
+        refreshInputDeviceListeners()
 
         // Read initial alert volume
         refreshAlertVolume()
@@ -306,7 +323,19 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         validateSystemSoundState()
     }
 
+    var isMonitoringReady: Bool {
+        defaultDeviceListenerBlock != nil && systemDeviceListenerBlock != nil
+            && defaultInputDeviceListenerBlock != nil
+    }
+
+    func repairChildListeners() {
+        guard isMonitoringReady else { return }
+        refreshDeviceListeners()
+        refreshInputDeviceListeners()
+    }
+
     func stop() {
+        listenerGeneration &+= 1
         logger.debug("Stopping device volume monitor")
 
         // Stop the device list observation loops
@@ -356,6 +385,8 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
         volumes.removeAll()
         muteStates.removeAll()
+        defaultDeviceID = .unknown
+        defaultDeviceUID = nil
         systemDeviceID = .unknown
         systemDeviceUID = nil
 
@@ -364,6 +395,10 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         defaultInputDeviceID = .unknown
         defaultInputDeviceUID = nil
     }
+
+    private var listenerGeneration: UInt64 = 0
+
+    func resetAfterServiceRestart() { stop() }
 
     /// Sub-1% floor for hardware/DDC scalar readbacks → true silence (scalar 0.01 ≈ -99 dB,
     /// empirically measured on built-in output). Software writes use `storedVolume` instead.
@@ -814,11 +849,13 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func addVolumeListener(for deviceID: AudioDeviceID) {
+        let generation = listenerGeneration
         guard deviceID.isValid else { return }
         guard volumeListeners[deviceID] == nil else { return }
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleVolumeChanged(for: deviceID)
             }
         }
@@ -929,11 +966,13 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func addMuteListener(for deviceID: AudioDeviceID) {
+        let generation = listenerGeneration
         guard deviceID.isValid else { return }
         guard muteListeners[deviceID] == nil else { return }
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleMuteChanged(for: deviceID)
             }
         }
@@ -1092,11 +1131,12 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
     private func subscribeOutputDeviceListObservation() {
         guard isObservingDeviceList else { return }
+        let generation = listenerGeneration
         withObservationTracking {
             _ = self.deviceMonitor.outputDevices
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self, self.isObservingDeviceList else { return }
+                guard let self, self.listenerGeneration == generation, self.isObservingDeviceList else { return }
                 self.logger.debug("Device list changed, refreshing volume listeners")
                 self.refreshDeviceListeners()
                 self.subscribeOutputDeviceListObservation()
@@ -1141,9 +1181,10 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
         let trackedMuteIDs = Set(inputMuteListeners.keys)
 
         // Add listeners for new devices
-        let newDeviceIDs = currentDeviceIDs.subtracting(trackedVolumeIDs)
-        for deviceID in newDeviceIDs {
+        for deviceID in currentDeviceIDs.subtracting(trackedVolumeIDs) {
             addInputVolumeListener(for: deviceID)
+        }
+        for deviceID in currentDeviceIDs.subtracting(trackedMuteIDs) {
             addInputMuteListener(for: deviceID)
         }
 
@@ -1166,11 +1207,13 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func addInputVolumeListener(for deviceID: AudioDeviceID) {
+        let generation = listenerGeneration
         guard deviceID.isValid else { return }
         guard inputVolumeListeners[deviceID] == nil else { return }
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleInputVolumeChanged(for: deviceID)
             }
         }
@@ -1214,11 +1257,13 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
     }
 
     private func addInputMuteListener(for deviceID: AudioDeviceID) {
+        let generation = listenerGeneration
         guard deviceID.isValid else { return }
         guard inputMuteListeners[deviceID] == nil else { return }
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.handleInputMuteChanged(for: deviceID)
             }
         }
@@ -1286,11 +1331,12 @@ final class DeviceVolumeMonitor: DeviceVolumeProviding {
 
     private func subscribeInputDeviceListObservation() {
         guard isObservingInputDeviceList else { return }
+        let generation = listenerGeneration
         withObservationTracking {
             _ = self.deviceMonitor.inputDevices
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self, self.isObservingInputDeviceList else { return }
+                guard let self, self.listenerGeneration == generation, self.isObservingInputDeviceList else { return }
                 self.logger.debug("Input device list changed, refreshing input volume listeners")
                 self.refreshInputDeviceListeners()
                 self.subscribeInputDeviceListObservation()

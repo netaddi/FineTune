@@ -68,6 +68,26 @@ final class RecordingProcessTapController: ProcessTapControlling {
     private var deviceSwitchContinuation: CheckedContinuation<Void, Never>?
     var hasPendingDeviceUpdate: Bool { deviceUpdateContinuation != nil }
     var hasPendingDeviceSwitch: Bool { deviceSwitchContinuation != nil }
+    var serviceRetirementCount = 0
+    var serviceRestartCallbacksDrained = true
+    var hasValidAudioResources = true
+    var isAudioResourceTransitionInProgress = false
+    var healthEligible = false
+    var recentCallback = false
+    var pauseInvalidation = false
+    private var invalidationContinuation: CheckedContinuation<Void, Never>?
+    var hasPendingInvalidation: Bool { invalidationContinuation != nil }
+    func invalidateAsync() async {
+        if pauseInvalidation {
+            await withCheckedContinuation { invalidationContinuation = $0 }
+        }
+        invalidate()
+    }
+    func resumeInvalidation() {
+        invalidationContinuation?.resume()
+        invalidationContinuation = nil
+    }
+    func retireAfterServiceRestart() { serviceRetirementCount += 1 }
 
     // Mutable surface — recorded as plain property writes (not events).
     var volume: Float = 1.0
@@ -114,8 +134,9 @@ final class RecordingProcessTapController: ProcessTapControlling {
         events.append(.invalidate)
     }
 
-    func invalidateForHandoff() {
+    @discardableResult func invalidateForHandoff() -> Bool {
         events.append(.invalidateForHandoff)
+        return true
     }
 
     func updateEQSettings(_ settings: EQSettings) {
@@ -203,8 +224,8 @@ final class RecordingProcessTapController: ProcessTapControlling {
         deviceSwitchContinuation = nil
     }
 
-    func hasRecentAudioCallback(within seconds: Double) -> Bool { false }
-    func isHealthCheckEligible(minActiveSeconds: Double) -> Bool { false }
+    func hasRecentAudioCallback(within seconds: Double) -> Bool { recentCallback }
+    func isHealthCheckEligible(minActiveSeconds: Double) -> Bool { healthEligible }
 
     func refreshTapSource(
         _ preferredDeviceUID: String?,
@@ -220,9 +241,15 @@ final class RecordingProcessTapController: ProcessTapControlling {
 final class StubProcessMonitor: AudioProcessMonitoring {
     var connectedApps: [AudioApp] = []
     var activeApps: [AudioApp] = []
+    var outputAppsOverride: [AudioApp]?
+    var activeOutputApps: [AudioApp] { outputAppsOverride ?? activeApps }
+    var resetCount = 0
+    var startCount = 0
+    var isMonitoringReady = true
     var onAppsChanged: (([AudioApp]) -> Void)?
-    func start() {}
+    func start() { startCount += 1 }
     func stop() {}
+    func resetAfterServiceRestart() { resetCount += 1 }
 }
 
 // MARK: - Fixture
@@ -238,6 +265,7 @@ private struct Fixture {
     let device: AudioDevice
     let lastTap: () -> RecordingProcessTapController?
     let allTaps: () -> [RecordingProcessTapController]
+    let failNextTapCreations: (Int) -> Void
 }
 
 @MainActor
@@ -328,7 +356,8 @@ private func makeFixture(
         app: app,
         device: device,
         lastTap: { box.last },
-        allTaps: { box.all }
+        allTaps: { box.all },
+        failNextTapCreations: { box.factoryFailuresRemaining = $0 }
     )
 }
 
@@ -340,6 +369,278 @@ private final class TapBox {
 }
 
 // MARK: - Suite
+
+@Suite("Core Audio service recovery", .serialized)
+@MainActor
+struct AudioServiceRecoveryTests {
+    /// Opt-in destructive integration check: an operator restarts coreaudiod twice
+    /// on a test machine after READY appears. Never sends signals by itself.
+    @Test("Real HAL restart notifications rebuild graphs twice",
+          .enabled(if: ProcessInfo.processInfo.environment["FINETUNE_TEST_AUDIO_SERVICE_RESTART"] == "1"))
+    func realHALRestartNotifications() async throws {
+        let fix = makeFixture()
+        let monitor = AudioServiceMonitor()
+        defer { monitor.stop(); fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        var count = 0
+        monitor.onRestart = {
+            count += 1
+            fix.engine.handleAudioServiceRestart()
+            FileHandle.standardError.write(Data("INTEGRATION_RESTART_RECEIVED: \(count)\n".utf8))
+        }
+        monitor.start()
+        FileHandle.standardError.write(Data("INTEGRATION_READY_FOR_HAL_RESTART\n".utf8))
+        for _ in 0..<900 {
+            if count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(count >= 2)
+        await settle(fix.engine)
+        #expect(!fix.engine.isRecoveringAudioService)
+        #expect(fix.engine.audioServiceRecoveryError == nil)
+        #expect(fix.allTaps().count >= 3)
+    }
+    private func settle(_ engine: AudioEngine) async {
+        for _ in 0..<200 {
+            if !engine.isRecoveringAudioService || engine.audioServiceRecoveryError != nil { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        Issue.record("Recovery did not settle within the test deadline")
+    }
+
+    @Test("Same PID and object IDs still create a new graph with saved first-buffer gain and the same AU")
+    func rebuildsSameIdentityWithoutReinstantiatingAU() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        let entry = AUEffectChainEntry(plugin: AUPluginDescriptor(
+            componentType: kAudioUnitType_Effect, componentSubType: 0x64656C79,
+            componentManufacturer: 0x6170706C, name: "AUDelay", manufacturer: "Apple", version: 1))
+        fix.settings.setAUEffectChain([entry], for: fix.app.persistenceIdentifier)
+        fix.settings.setVolume(for: fix.app.persistenceIdentifier, to: 0.125)
+        fix.engine.pinApp(fix.app)
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        let chain = try #require(old.attachedAppAUChain)
+        let host = try #require(chain.host(for: entry.id))
+        fix.engine.handleAudioServiceRestart()
+        #expect(fix.engine.isRecoveringAudioService)
+        #expect(old.serviceRetirementCount == 1)
+        #expect(!old.events.contains(.invalidateForHandoff))
+        await settle(fix.engine)
+        let replacement = try #require(fix.lastTap())
+        #expect(replacement !== old)
+        #expect(replacement.volume == 0.125)
+        #expect(replacement.attachedAppAUChain === chain)
+        #expect(replacement.attachedAppAUChain?.host(for: entry.id) === host)
+        #expect(replacement.startupEvents.prefix(3) == [.attachAppAU, .attachDeviceAU, .activate])
+        #expect(fix.processMonitor.resetCount >= 1)
+        #expect(fix.engine.audioServiceRecoveryError == nil)
+    }
+
+    @Test("A stuck old callback reports failure and never creates a second producer")
+    func stuckCallbackKeepsProvisioningClosed() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.serviceRestartCallbacksDrained = false
+        fix.engine.serviceRecoveryDrainPolls = 1
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.engine.audioServiceRecoveryError != nil)
+        fix.engine.applyPersistedSettings()
+        #expect(fix.allTaps().count == 1)
+        old.serviceRestartCallbacksDrained = true
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Stop cancels recovery, including a callback drain already in progress")
+    func stopDoesNotResurrectMonitors() async throws {
+        let fix = makeFixture()
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.serviceRestartCallbacksDrained = false
+        fix.engine.handleAudioServiceRestart()
+        await Task.yield()
+        fix.engine.stop()
+        old.serviceRestartCallbacksDrained = true
+        try? await Task.sleep(for: .milliseconds(40))
+        #expect(fix.allTaps().count == 1)
+        #expect(fix.processMonitor.startCount == 0)
+    }
+
+    @Test("Back-to-back restarts coalesce into the newest recovery")
+    func repeatedResetOnlyRebuildsOnce() async {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        fix.engine.handleAudioServiceRestart()
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Unavailable default output reports failure and can recover on retry")
+    func missingDefaultIsNotSuccessfulRecovery() async {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        fix.deviceVolume.defaultDeviceUID = nil
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.engine.audioServiceRecoveryError != nil)
+        #expect(fix.allTaps().count == 1)
+        fix.deviceVolume.defaultDeviceUID = fix.device.uid
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Failed listener registration cannot be reported as recovered")
+    func registrationFailureIsVisible() async {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        fix.processMonitor.isMonitoringReady = false
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        #expect(fix.engine.audioServiceRecoveryError != nil)
+        #expect(fix.allTaps().isEmpty)
+    }
+
+    @Test("Never-started output recovers after three misses; input-only and pause reset misses")
+    func outputOnlyHealthCheck() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.healthEligible = true
+        await fix.engine.checkTapHealth()
+        await fix.engine.checkTapHealth()
+        fix.processMonitor.outputAppsOverride = []
+        await fix.engine.checkTapHealth()
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 1)
+        fix.processMonitor.outputAppsOverride = [fix.app]
+        await fix.engine.checkTapHealth()
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 1)
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Invalid HAL identity is repaired even for a paused app")
+    func pausedInvalidIdentityIsRepaired() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.hasValidAudioResources = false
+        fix.processMonitor.activeApps = []
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Health checks do not interrupt an in-flight route resource transition")
+    func validRouteTransitionIsNotADeadTap() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let tap = try #require(fix.lastTap())
+        tap.hasValidAudioResources = false
+        tap.isAudioResourceTransitionInProgress = true
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 1)
+        tap.isAudioResourceTransitionInProgress = false
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("A failed health replacement shows protection loss and clears it only after retry succeeds")
+    func failedHealthReplacementIsVisible() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let tap = try #require(fix.lastTap())
+        tap.hasValidAudioResources = false
+        fix.failNextTapCreations(20)
+        await fix.engine.checkTapHealth()
+        #expect(fix.engine.audioServiceRecoveryError != nil)
+        #expect(fix.allTaps().count == 1)
+        fix.failNextTapCreations(0)
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 2)
+        #expect(fix.engine.audioServiceRecoveryError == nil)
+    }
+
+    @Test("Late pre-reset route completion cannot update the replacement graph")
+    func oldRouteCompletionIsIgnored() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.pauseNextDeviceSwitch = true
+        let other = AudioDevice(id: 101, uid: "uid-other", name: "Other", icon: nil, supportsAutoEQ: false)
+        fix.deviceMonitor.addOutputDevice(other)
+        fix.engine.setDevice(for: fix.app, deviceUID: other.uid)
+        for _ in 0..<20 where !old.hasPendingDeviceSwitch { await Task.yield() }
+        fix.engine.serviceRecoveryRetryDelays = [.zero]
+        fix.engine.handleAudioServiceRestart()
+        await settle(fix.engine)
+        let replacement = try #require(fix.lastTap())
+        old.resumePendingDeviceSwitch()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(replacement !== old)
+        #expect(fix.lastTap() === replacement)
+        #expect(replacement.currentDeviceUID == other.uid)
+    }
+
+    @Test("Standby creation cannot overtake an in-flight persistent producer handoff")
+    func asyncHandoffBlocksStandbyProducer() async throws {
+        let fix = makeFixture(enableColdStartPrearming: true)
+        defer { fix.engine.stop() }
+        fix.engine.pinApp(fix.app)
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.hasValidAudioResources = false
+        old.pauseInvalidation = true
+        let repair = Task { await fix.engine.checkTapHealth() }
+        for _ in 0..<30 where !old.hasPendingInvalidation { await Task.yield() }
+        #expect(old.hasPendingInvalidation)
+        fix.processMonitor.connectedApps = []
+        fix.processMonitor.activeApps = []
+        fix.processMonitor.onAppsChanged?([])
+        #expect(fix.allTaps().count == 1)
+        old.resumeInvalidation()
+        await repair.value
+        #expect(fix.allTaps().count == 2)
+    }
+
+    @Test("Stop and start during an async handoff cannot permanently block provisioning")
+    func stopStartDuringHandoffRecovers() async throws {
+        let fix = makeFixture()
+        defer { fix.engine.stop() }
+        fix.engine.applyPersistedSettings()
+        let old = try #require(fix.lastTap())
+        old.hasValidAudioResources = false
+        old.pauseInvalidation = true
+        let repair = Task { await fix.engine.checkTapHealth() }
+        for _ in 0..<30 where !old.hasPendingInvalidation { await Task.yield() }
+        fix.engine.stop()
+        fix.engine.start()
+        #expect(fix.allTaps().count == 1)
+        old.resumeInvalidation()
+        await repair.value
+        await fix.engine.checkTapHealth()
+        #expect(fix.allTaps().count == 2)
+    }
+}
 
 @Suite("AudioEngine.tapInitialState — first-sound fix (PR-1)")
 @MainActor

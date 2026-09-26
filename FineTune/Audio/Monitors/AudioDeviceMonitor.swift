@@ -47,6 +47,7 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AudioDeviceMonitor")
 
     private var deviceListListenerBlock: AudioObjectPropertyListenerBlock?
+    private var listenerGeneration: UInt64 = 0
     private var deviceListAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -84,6 +85,9 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
 
     func start() {
         guard deviceListListenerBlock == nil else { return }
+        stop() // Invalidate any child listeners from a partially successful start.
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
 
         logger.debug("Starting audio device monitor")
 
@@ -91,6 +95,7 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
 
         deviceListListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.scheduleDeviceListRefresh()
             }
         }
@@ -103,11 +108,27 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
         )
 
         if status != noErr {
+            deviceListListenerBlock = nil
             logger.error("Failed to add device list listener: \(status)")
         }
+        // Close the enumerate→subscribe race while HAL is rediscovering devices.
+        refresh()
+    }
+
+    var isMonitoringReady: Bool { deviceListListenerBlock != nil }
+
+    func repairChildListeners() {
+        guard isMonitoringReady else { return }
+        syncDataSourceListeners(outputDeviceIDs: outputDevices.map(\.id))
+        let bluetoothIDs = Set(outputDevices.compactMap { device -> AudioDeviceID? in
+            let transport = device.id.readTransportType()
+            return transport == .bluetooth || transport == .bluetoothLE ? device.id : nil
+        })
+        syncSampleRateListeners(btOutputDeviceIDs: bluetoothIDs)
     }
 
     func stop() {
+        listenerGeneration &+= 1
         logger.debug("Stopping audio device monitor")
 
         deviceListDebounceTask?.cancel()
@@ -119,6 +140,18 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
         }
         removeAllDataSourceListeners()
         removeAllSampleRateListeners()
+    }
+
+    func resetAfterServiceRestart() {
+        stop()
+        outputDevices = []
+        inputDevices = []
+        devicesByUID = [:]
+        devicesByID = [:]
+        inputDevicesByUID = [:]
+        inputDevicesByID = [:]
+        knownDeviceUIDs = []
+        knownInputDeviceUIDs = []
     }
 
     /// O(1) lookup by device UID (output devices)
@@ -244,8 +277,10 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
                 mScope: kAudioObjectPropertyScopeOutput,
                 mElement: kAudioObjectPropertyElementMain
             )
+            let generation = listenerGeneration
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 Task { @MainActor [weak self] in
+                    guard self?.listenerGeneration == generation else { return }
                     self?.scheduleDeviceListRefresh()
                 }
             }
@@ -297,8 +332,10 @@ final class AudioDeviceMonitor: AudioDeviceProviding {
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain
             )
+            let generation = listenerGeneration
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 Task { @MainActor [weak self] in
+                    guard self?.listenerGeneration == generation else { return }
                     self?.scheduleSampleRateCheck(forDeviceID: deviceID, uid: uid)
                 }
             }

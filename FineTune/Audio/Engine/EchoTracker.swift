@@ -71,4 +71,6 @@ final class EchoTracker {
     var hasPending: Bool {
         !activeTimeouts.isEmpty
     }
+
+    func reset() { activeTimeouts.removeAll() }
 }

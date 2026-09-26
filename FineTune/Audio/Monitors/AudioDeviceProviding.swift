@@ -15,4 +15,13 @@ protocol AudioDeviceProviding: AnyObject {
 
     func start()
     func stop()
+    func resetAfterServiceRestart()
+    var isMonitoringReady: Bool { get }
+    func repairChildListeners()
+}
+
+extension AudioDeviceProviding {
+    var isMonitoringReady: Bool { true }
+    func repairChildListeners() {}
+    func resetAfterServiceRestart() { stop() }
 }

@@ -103,6 +103,7 @@ brew install --cask finetune
 ## 文档
 
 - **[固定 Console 1 轨道](guide/console1.zh-CN.md)** —— 将置顶 App 绑定到稳定的 Console 1 strip、设置启动顺序，并恢复意外的轨道分配
+- **[Core Audio 恢复](guide/coreaudio-recovery.md)** —— 音频服务重启后的自动重建、验证方法与音量保护边界（英文）
 - **[AutoEQ 与耳机校正](guide/autoeq.zh-CN.md)** —— 应用来自 [AutoEQ](https://github.com/jaakkopasanen/AutoEq) 项目的频响校正、导入 [EqualizerAPO](https://sourceforge.net/projects/equalizerapo/) 配置，或浏览 [autoeq.app](https://www.autoeq.app/)
 - **[URL Scheme](guide/url-schemes.md)** —— 通过终端、[快捷指令](https://support.apple.com/guide/shortcuts-mac)、[Raycast](https://raycast.com) 或脚本自动化 FineTune
 - **[排查指引](guide/troubleshooting.md)** —— 权限问题、应用未出现、声音异常等

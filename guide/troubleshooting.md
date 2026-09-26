@@ -12,6 +12,12 @@ If you previously denied the permission prompt, you'll need to enable it manuall
 
 ## App not appearing
 
+If this follows a Core Audio restart, check FineTune's recovery warning first.
+FineTune automatically rebuilds listeners and required capture graphs. If the
+warning persists, pause playback before using **Retry** or restarting FineTune:
+volume protection is not guaranteed while capture is unavailable. See
+[Core Audio recovery](coreaudio-recovery.md) for behavior and known limits.
+
 FineTune only shows apps that are **actively playing audio**. If an app isn't visible:
 
 - Make sure the app is actually producing sound (start playback)

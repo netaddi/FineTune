@@ -31,6 +31,9 @@ private struct AppFingerprint: Hashable {
 final class AudioProcessMonitor: AudioProcessMonitoring {
     private(set) var connectedApps: [AudioApp] = []
     private(set) var activeApps: [AudioApp] = []
+    private(set) var activeOutputApps: [AudioApp] = []
+    private var listenerGeneration: UInt64 = 0
+    private var successfulSnapshotGeneration: UInt64?
     var onAppsChanged: (([AudioApp]) -> Void)?
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "AudioProcessMonitor")
@@ -96,6 +99,7 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
     // Property listeners
     private var processListListenerBlock: AudioObjectPropertyListenerBlock?
     private var processListenerBlocks: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
+    private var outputListenerProcessIDs: Set<AudioObjectID> = []
     private var monitoredProcesses: Set<AudioObjectID> = []
     private var periodicRefreshTask: Task<Void, Never>?
 
@@ -160,13 +164,20 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
     }
 
     func start() {
-        guard processListListenerBlock == nil else { return }
+        if processListListenerBlock != nil {
+            if !isMonitoringReady { refresh() }
+            return
+        }
+        stop() // Drop child listeners left by an earlier failed registration.
+        listenerGeneration &+= 1
+        let generation = listenerGeneration
 
         logger.debug("Starting audio process monitor")
 
         // Set up listener first
         processListListenerBlock = { [weak self] numberAddresses, addresses in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.refresh()
             }
         }
@@ -179,6 +190,7 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
         )
 
         if status != noErr {
+            processListListenerBlock = nil
             logger.error("Failed to add process list listener: \(status)")
         }
 
@@ -191,6 +203,8 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
     }
 
     func stop() {
+        listenerGeneration &+= 1
+        successfulSnapshotGeneration = nil
         logger.debug("Stopping audio process monitor")
 
         periodicRefreshTask?.cancel()
@@ -204,6 +218,17 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
 
         // Remove all per-process listeners
         removeAllProcessListeners()
+    }
+
+    func resetAfterServiceRestart() {
+        stop()
+        connectedApps = []
+        activeApps = []
+        activeOutputApps = []
+    }
+
+    var isMonitoringReady: Bool {
+        processListListenerBlock != nil && successfulSnapshotGeneration == listenerGeneration
     }
 
     private func startPeriodicRefresh() {
@@ -230,9 +255,18 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
             let myPID = ProcessInfo.processInfo.processIdentifier
 
             var appsByPID: [pid_t: AudioApp] = [:]
+            var snapshotComplete = true
 
             for objectID in processIDs {
-                guard let pid = try? objectID.readProcessPID(), pid != myPID else { continue }
+                let pid: pid_t
+                do { pid = try objectID.readProcessPID() } catch {
+                    let nsError = error as NSError
+                    if nsError.domain != NSOSStatusErrorDomain || nsError.code != Int(kAudioHardwareBadObjectError) {
+                        snapshotComplete = false
+                    }
+                    continue
+                }
+                guard pid != myPID else { continue }
 
                 // Try to find the parent app (for helper processes like Safari Graphics and Media)
                 let directApp = runningAppsByPID[pid]
@@ -295,10 +329,23 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
 
             // Update per-process listeners
             updateProcessListeners(for: processIDs)
+            guard snapshotComplete else {
+                successfulSnapshotGeneration = nil
+                // Keep the last complete view; a transient PID read must not pretend
+                // an app exited or allow recovery to succeed with a partial snapshot.
+                return
+            }
 
             let connected = Self.coalesceLogicalApps(Array(appsByPID.values))
             let active = Self.appsRunningAudio(from: connected) { objectID in
                 objectID.readProcessIsRunning()
+            }
+            activeOutputApps = Self.appsRunningAudio(from: connected) { objectID in
+                var address = AudioObjectPropertyAddress(mSelector: kAudioProcessPropertyIsRunningOutput,
+                    mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+                var running: UInt32 = 0
+                var size = UInt32(MemoryLayout<UInt32>.size)
+                return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &running) == noErr && running != 0
             }
 
             // Fire when either lifecycle surface changes. In particular, a newly connected
@@ -313,11 +360,13 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
 
             connectedApps = connected
             activeApps = active
+            if snapshotComplete { successfulSnapshotGeneration = listenerGeneration }
             if lifecycleChanged {
                 onAppsChanged?(activeApps)
             }
 
         } catch {
+            successfulSnapshotGeneration = nil
             logger.error("Failed to refresh process list: \(error.localizedDescription)")
         }
     }
@@ -384,33 +433,48 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
         }
 
         // Add listeners for new processes
-        let added = currentSet.subtracting(monitoredProcesses)
+        let added = currentSet.filter {
+            processListenerBlocks[$0] == nil || !outputListenerProcessIDs.contains($0)
+        }
         for objectID in added {
             addProcessListener(for: objectID)
         }
 
-        monitoredProcesses = currentSet
+        monitoredProcesses = Set(processListenerBlocks.keys)
     }
 
     private func addProcessListener(for objectID: AudioObjectID) {
+        let generation = listenerGeneration
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioProcessPropertyIsRunning,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
 
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+        let block: AudioObjectPropertyListenerBlock = processListenerBlocks[objectID] ?? { [weak self] _, _ in
             Task { @MainActor [weak self] in
+                guard self?.listenerGeneration == generation else { return }
                 self?.refresh()
             }
         }
 
-        let status = AudioObjectAddPropertyListenerBlock(objectID, &address, .main, block)
-
-        if status == noErr {
+        if processListenerBlocks[objectID] == nil {
+            let status = AudioObjectAddPropertyListenerBlock(objectID, &address, .main, block)
+            guard status == noErr else {
+                logger.warning("Failed to add isRunning listener for \(objectID): \(status)")
+                return
+            }
+            // Retain each successful selector even when the second add fails. A
+            // best-effort rollback could itself fail and leak duplicate callbacks.
             processListenerBlocks[objectID] = block
+        }
+        guard !outputListenerProcessIDs.contains(objectID) else { return }
+        address.mSelector = kAudioProcessPropertyIsRunningOutput
+        let outputStatus = AudioObjectAddPropertyListenerBlock(objectID, &address, .main, block)
+        if outputStatus == noErr {
+            outputListenerProcessIDs.insert(objectID)
         } else {
-            logger.warning("Failed to add isRunning listener for \(objectID): \(status)")
+            logger.warning("Failed to add output activity listener for \(objectID): \(outputStatus)")
         }
     }
 
@@ -424,6 +488,10 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
         )
 
         let status = AudioObjectRemovePropertyListenerBlock(objectID, &address, .main, block)
+        if outputListenerProcessIDs.remove(objectID) != nil {
+            address.mSelector = kAudioProcessPropertyIsRunningOutput
+            AudioObjectRemovePropertyListenerBlock(objectID, &address, .main, block)
+        }
         // Tolerate kAudioHardwareBadObjectError (-66680): process object already destroyed
         if status != noErr && status != OSStatus(kAudioHardwareBadObjectError) {
             logger.warning("Failed to remove isRunning listener for \(objectID): \(status)")
@@ -436,6 +504,7 @@ final class AudioProcessMonitor: AudioProcessMonitoring {
         }
         monitoredProcesses.removeAll()
         processListenerBlocks.removeAll()
+        outputListenerProcessIDs.removeAll()
     }
 
 }

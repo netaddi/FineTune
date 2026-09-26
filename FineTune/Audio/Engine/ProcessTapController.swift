@@ -210,6 +210,29 @@ final class ProcessTapController: ProcessTapControlling {
 
     // Core Audio resources (primary tap) — TapResources enforces correct teardown order
     private var primaryResources = TapResources()
+    private nonisolated let callbackLifetime = AudioCallbackLifetime()
+    private var retiredByServiceRestart = false
+
+    var serviceRestartCallbacksDrained: Bool {
+        callbackLifetime.isDrained && !deviceOperationInProgress && !isSwitching
+            && (retiredByServiceRestart || !_invalidating)
+    }
+    var hasValidAudioResources: Bool { primaryResources.hasMatchingIdentity }
+    var isAudioResourceTransitionInProgress: Bool { deviceOperationInProgress || isSwitching }
+
+    func retireAfterServiceRestart() {
+        retiredByServiceRestart = true
+        callbackLifetime.retire()
+        activated = false
+        crossfadeTask?.cancel()
+        appAUReconfigureTask?.cancel()
+        deviceAUReconfigureTask?.cancel()
+        primaryResources.abandonAfterServiceRestart()
+        secondaryResources.abandonAfterServiceRestart()
+        // Keep processors and callback role fields intact until all existing readers
+        // return. The engine does not attach the persistent strip to another producer
+        // until serviceRestartCallbacksDrained is true.
+    }
     /// Last sample rate read successfully from the active primary aggregate. Once an
     /// aggregate is committed, processing configuration must use this value rather than
     /// treating a transient HAL property failure as 48 kHz.
@@ -258,9 +281,8 @@ final class ProcessTapController: ProcessTapControlling {
         return deltaNanos <= (seconds * 1_000_000_000.0)
     }
 
-    /// Health checks should only run after activation has settled and at least one callback occurred.
+    /// Allow activation to settle, including graphs which never delivered a first callback.
     func isHealthCheckEligible(minActiveSeconds: Double) -> Bool {
-        guard _hasRenderedAudio else { return false }
         let started = _activationHostTime
         guard started != 0 else { return false }
         let deltaNanos = Double(mach_absolute_time() &- started) * Self.hostTimeNanosScale
@@ -430,7 +452,10 @@ final class ProcessTapController: ProcessTapControlling {
                 // promoted callback cannot run again until the chain is published below.
                 _callbackHandoffGeneration &+= 1
                 OSMemoryBarrier()
-                TapResources.waitForPendingDestruction()
+                guard TapResources.waitForPendingDestruction(timeout: .milliseconds(100)) else {
+                    logger.error("AU attachment deferred: the old audio producer has not joined")
+                    return
+                }
                 crossfadeState.complete()
                 promoteSecondaryToPrimary()
                 promotedCrossfadeDestination = true
@@ -1001,8 +1026,15 @@ final class ProcessTapController: ProcessTapControlling {
     }
 
     func activate(initial: TapInitialState) throws {
+        guard !retiredByServiceRestart else { throw CancellationError() }
         guard !activated else { return }
-
+        if primaryResources.isActive {
+            guard primaryResources.destroy() else {
+                throw NSError(domain: "ProcessTapController", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Previous capture cleanup is still pending"])
+            }
+            primaryResources = TapResources()
+        }
         logger.debug("Activating tap for \(self.app.name)")
 
         // Reset health tracking for fresh activation
@@ -1044,6 +1076,7 @@ final class ProcessTapController: ProcessTapControlling {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "Failed to create aggregate device: \(err)"])
         }
         primaryResources.aggregateDeviceID = aggID
+        primaryResources.aggregateUID = description[kAudioAggregateDeviceUIDKey] as? String
         CrashGuard.trackDevice(aggID)
 
         guard primaryResources.aggregateDeviceID.waitUntilReady(timeout: 2.0) else {
@@ -1381,18 +1414,21 @@ final class ProcessTapController: ProcessTapControlling {
     /// Stops and joins the HAL callback before a replacement tap is allowed to attach
     /// the same persistent Console strip. This path may block for one IO cycle and is
     /// intentionally reserved for logical-app producer handoff.
-    func invalidateForHandoff() {
-        guard beginInvalidation() else { return }
-        defer { endInvalidation() }
-        secondaryResources.destroy()
-        primaryResources.destroy()
+    @discardableResult func invalidateForHandoff() -> Bool {
+        if retiredByServiceRestart { return serviceRestartCallbacksDrained }
+        if !_invalidating, !beginInvalidation() { return true }
+        let secondaryDone = secondaryResources.destroy()
+        let primaryDone = primaryResources.destroy()
+        guard secondaryDone && primaryDone else { return false }
+        endInvalidation()
         logger.info("Tap invalidated synchronously for persistent strip handoff: \(self.app.name)")
+        return true
     }
 
     /// Awaitable invalidation: suspends until CoreAudio resources are fully
     /// destroyed. Prevents orphaned IO procs when a new tap is created immediately after.
     func invalidateAsync() async {
-        guard beginInvalidation() else { return }
+        if !_invalidating, !beginInvalidation() { return }
         defer { endInvalidation() }
 
         // Register both resource sets before this actor method first suspends. An app-exit
@@ -1444,6 +1480,10 @@ final class ProcessTapController: ProcessTapControlling {
 
     /// Shared epilogue for invalidation. Clears EQ state and resets the reentrant guard.
     private func endInvalidation() {
+        guard !retiredByServiceRestart else {
+            _invalidating = false
+            return
+        }
         primaryAggregateSampleRate = nil
         secondaryAggregateSampleRate = 48_000
         secondaryEQProcessor = nil
@@ -1611,6 +1651,14 @@ final class ProcessTapController: ProcessTapControlling {
         tapSourceDeviceUID: String?
     ) throws {
         precondition(!outputUIDs.isEmpty, "Must have at least one output device")
+        // Do not overwrite IDs while an old CleanupJob still owns their teardown.
+        if secondaryResources.isActive {
+            guard secondaryResources.destroy() else {
+                throw NSError(domain: "ProcessTapController", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Previous secondary cleanup is still pending"])
+            }
+        }
+        secondaryResources = TapResources()
         secondaryTargetDeviceUIDs = outputUIDs
         secondaryTapSourceDeviceUID = tapSourceDeviceUID
 
@@ -1646,6 +1694,7 @@ final class ProcessTapController: ProcessTapControlling {
             throw CrossfadeError.aggregateCreationFailed(err)
         }
         secondaryResources.aggregateDeviceID = aggID
+        secondaryResources.aggregateUID = description[kAudioAggregateDeviceUIDKey] as? String
         CrashGuard.trackDevice(aggID)
 
         guard secondaryResources.aggregateDeviceID.waitUntilReady(timeout: 2.0) else {
@@ -1752,6 +1801,7 @@ final class ProcessTapController: ProcessTapControlling {
     /// increments before it (and is drained) or rechecks the odd generation before it
     /// can touch shared secondary state.
     private func retireSecondaryCallbacks() {
+        guard !retiredByServiceRestart else { return }
         if _secondaryStateGeneration & 1 == 0 {
             _secondaryStateGeneration &+= 1
         }
@@ -1769,6 +1819,7 @@ final class ProcessTapController: ProcessTapControlling {
     /// the generation publication cannot race ARC deallocation. Its generation checks
     /// prevent those values from being emitted or confused with the replacement tap.
     private func beginSecondarySnapshotReplacement() {
+        guard !retiredByServiceRestart else { return }
         retireSecondaryCallbacks()
 
         let oldEQ = secondaryEQProcessor
@@ -1796,11 +1847,12 @@ final class ProcessTapController: ProcessTapControlling {
 
     /// Tears down any in-progress secondary tap (used by re-entrant crossfade guard).
     private func cleanupSecondaryTap() {
+        guard !retiredByServiceRestart else { return }
         let hadLiveSecondary = _secondaryCallbackID != 0 || secondaryResources.isActive
         _secondaryCallbackID = 0
         OSMemoryBarrier()
         if secondaryResources.isActive {
-            secondaryResources.destroy()
+            guard secondaryResources.destroy() else { return }
         }
         secondaryTargetDeviceUIDs.removeAll()
         secondaryTapSourceDeviceUID = nil
@@ -1973,6 +2025,7 @@ final class ProcessTapController: ProcessTapControlling {
             throw CrossfadeError.aggregateCreationFailed(err)
         }
         newResources.aggregateDeviceID = aggID
+        newResources.aggregateUID = description[kAudioAggregateDeviceUIDKey] as? String
         CrashGuard.trackDevice(aggID)
 
         guard newResources.aggregateDeviceID.waitUntilReady(timeout: 2.0) else {
@@ -2044,7 +2097,12 @@ final class ProcessTapController: ProcessTapControlling {
         _primaryCallbackID = switchCallbackID
 
         // Destroy old resources, adopt new
-        primaryResources.destroy()
+        guard primaryResources.destroy() else {
+            newResources.destroyAsync()
+            _primaryCallbackID = 0
+            throw NSError(domain: "ProcessTapController", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "Previous audio graph cleanup is still pending"])
+        }
         primaryResources = newResources
         primaryAggregateSampleRate = deviceSampleRate
         targetDeviceUIDs = outputUIDs
@@ -2095,6 +2153,13 @@ final class ProcessTapController: ProcessTapControlling {
     private func cleanupPartialActivation() {
         primaryResources.destroy()
         primaryAggregateSampleRate = nil
+    }
+
+    @inline(__always)
+    nonisolated static func callbackCountsForHealth(callbackID: UInt32, primaryID: UInt32,
+                                                   handoffAtStart: UInt64, currentHandoff: UInt64) -> Bool {
+        callbackID != 0 && callbackID == primaryID && handoffAtStart & 1 == 0
+            && handoffAtStart == currentHandoff
     }
 
     /// Pure RT-safe generation policy, exposed internally for adversarial tests.
@@ -2666,8 +2731,13 @@ final class ProcessTapController: ProcessTapControlling {
         to outputBufferList: UnsafeMutablePointer<AudioBufferList>,
         callbackID: UInt32
     ) {
-        _lastRenderHostTime = mach_absolute_time()
-        _hasRenderedAudio = true
+        guard callbackLifetime.enter() else {
+            for buffer in UnsafeMutableAudioBufferListPointer(outputBufferList) {
+                if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+            }
+            return
+        }
+        defer { callbackLifetime.leave() }
 
         let handoffGenerationAtStart = _callbackHandoffGeneration
         let isPrimary = (callbackID == _primaryCallbackID)
@@ -2728,6 +2798,15 @@ final class ProcessTapController: ProcessTapControlling {
                 }
                 return
             }
+        }
+
+        // An outgoing IOProc may continue delivering zeroed stale buffers while its
+        // background teardown is pending. Those callbacks do not prove capture works.
+        if Self.callbackCountsForHealth(callbackID: callbackID, primaryID: _primaryCallbackID,
+                                        handoffAtStart: handoffGenerationAtStart,
+                                        currentHandoff: _callbackHandoffGeneration) {
+            _lastRenderHostTime = mach_absolute_time()
+            _hasRenderedAudio = true
         }
 
         // A persistent app chain may be attached while an async crossfade is between

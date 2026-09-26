@@ -38,6 +38,10 @@ and ordinary effect or chain bypasses. Bypassing therefore does not release the
 startup position. Removing Console 1, unpinning or ignoring the app releases
 its position and compacts the remaining order.
 
+Audio-server restart recovery also retains persistent hosts while retiring and
+rebuilding the audio graphs. Capture is not guaranteed during the outage; see
+[Core Audio recovery](coreaudio-recovery.md) for warnings and safety limits.
+
 A plug-in quarantined after a crash is not instantiated and does not reserve a
 position. Resolve the plug-in problem before removing and adding it again; this
 prevents a repeated startup crash loop.

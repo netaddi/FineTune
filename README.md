@@ -102,6 +102,7 @@ That's it. Adjust sliders, route audio, and explore EQ from the menu bar.
 ## Documentation
 
 - **[Persistent Console 1 Tracks](guide/console1.md)** — Bind pinned apps to stable Console 1 strips, control startup order, and recover an unexpected track assignment
+- **[Core Audio Recovery](guide/coreaudio-recovery.md)** — Automatic graph recovery after audio-server restarts, validation, and protection limits
 - **[AutoEQ & Headphone Correction](guide/autoeq.md)** — Apply frequency correction from the [AutoEQ](https://github.com/jaakkopasanen/AutoEq) project, import [EqualizerAPO](https://sourceforge.net/projects/equalizerapo/) profiles, or browse [autoeq.app](https://www.autoeq.app/)
 - **[URL Schemes](guide/url-schemes.md)** — Automate FineTune from Terminal, [Shortcuts](https://support.apple.com/guide/shortcuts-mac), [Raycast](https://raycast.com), or scripts
 - **[Troubleshooting](guide/troubleshooting.md)** — Permission issues, missing apps, audio problems

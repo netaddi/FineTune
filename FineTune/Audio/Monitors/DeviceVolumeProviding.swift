@@ -45,6 +45,9 @@ protocol DeviceVolumeProviding: AnyObject {
 
     func start()
     func stop()
+    func resetAfterServiceRestart()
+    var isMonitoringReady: Bool { get }
+    func repairChildListeners()
 
     /// Called after DDC probe completes to refresh volume/mute states.
     /// Default implementation is a no-op (only relevant for DDC-capable monitors).
@@ -52,6 +55,9 @@ protocol DeviceVolumeProviding: AnyObject {
 }
 
 extension DeviceVolumeProviding {
+    var isMonitoringReady: Bool { true }
+    func repairChildListeners() {}
+    func resetAfterServiceRestart() { stop() }
     func outputProcessingGain(for deviceID: AudioDeviceID) -> Float {
         1.0
     }
